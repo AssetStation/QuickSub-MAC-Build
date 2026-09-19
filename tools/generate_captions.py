@@ -25,7 +25,8 @@ if IS_FROZEN:
     for _ in range(4):
         if (os.path.exists(os.path.join(candidate, "models")) or 
             os.path.exists(os.path.join(candidate, "win", "ffmpeg.exe")) or 
-            os.path.exists(os.path.join(candidate, "mac", "ffmpeg"))):
+            os.path.exists(os.path.join(candidate, "mac", "ffmpeg")) or
+            os.path.exists(os.path.join(candidate, "mac", "ffmpeg_arm64"))):
             FOUND_TOOLS_DIR = candidate
             break
         candidate = os.path.dirname(candidate)
@@ -255,8 +256,21 @@ except ImportError:
 def extract_audio(input_file, start_time, duration, output_wav):
     import sys
     if sys.platform == "darwin":
-        ffmpeg_exe = os.path.join(SCRIPT_DIR, "mac", "ffmpeg")
-        if not os.access(ffmpeg_exe, os.X_OK):
+        import platform
+        is_arm = platform.machine().lower() in ["arm64", "aarch64"]
+        arm_ffmpeg = os.path.join(SCRIPT_DIR, "mac", "ffmpeg_arm64")
+        if is_arm and os.path.exists(arm_ffmpeg):
+            ffmpeg_exe = arm_ffmpeg
+        else:
+            ffmpeg_exe = os.path.join(SCRIPT_DIR, "mac", "ffmpeg")
+            
+        if not os.path.exists(ffmpeg_exe):
+            for sys_path in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]:
+                if os.path.exists(sys_path):
+                    ffmpeg_exe = sys_path
+                    break
+
+        if os.path.exists(ffmpeg_exe) and not os.access(ffmpeg_exe, os.X_OK):
             try:
                 os.chmod(ffmpeg_exe, 0o755)
             except Exception:
