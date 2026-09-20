@@ -52,15 +52,13 @@ jobs:
 
       - name: Set Permissions & Ad-hoc Sign
         run: |
-          chmod -R +x tools/mac/engine
-          codesign --force --deep --sign - tools/mac/engine/generate_captions
-          # Also duplicate as engine_arm64 so both directory paths in main.js resolve cleanly
-          cp -r tools/mac/engine tools/mac/engine_arm64
+          chmod -R +x tools/mac/engine_arm64
+          codesign --force --deep --sign - tools/mac/engine_arm64/generate_captions
 
       - name: Compress macOS ARM64 Engine
         run: |
           cd tools/mac
-          zip -r ../../quicksub-engine-mac-arm64.zip engine engine_arm64
+          zip -r ../../quicksub-engine-mac-arm64.zip engine_arm64
 
       - name: Upload macOS ARM64 Artifact
         uses: actions/upload-artifact@v4
@@ -99,15 +97,13 @@ jobs:
 
       - name: Set Permissions & Ad-hoc Sign
         run: |
-          chmod -R +x tools/mac/engine
-          codesign --force --deep --sign - tools/mac/engine/generate_captions
-          # Also duplicate as engine_x64 so both directory paths in main.js resolve cleanly
-          cp -r tools/mac/engine tools/mac/engine_x64
+          chmod -R +x tools/mac/engine_x64
+          codesign --force --deep --sign - tools/mac/engine_x64/generate_captions
 
       - name: Compress macOS Intel Engine
         run: |
           cd tools/mac
-          zip -r ../../quicksub-engine-mac-x64.zip engine engine_x64
+          zip -r ../../quicksub-engine-mac-x64.zip engine_x64
 
       - name: Upload macOS Intel Artifact
         uses: actions/upload-artifact@v4
