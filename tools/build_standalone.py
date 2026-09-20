@@ -84,6 +84,7 @@ def build_standalone(include_cuda=False):
         "--collect-all", "faster_whisper",
         "--collect-all", "tokenizers",
         "--collect-all", "huggingface_hub",
+        "--collect-all", "tqdm",
         "--collect-all", "onnxruntime",
         "--collect-all", "cryptography",
         "--collect-all", "certifi",

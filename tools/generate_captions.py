@@ -210,42 +210,167 @@ def verify_execution_session(config):
 
 
 
+import shutil
 try:
     import tqdm
     import tqdm.auto
-    _orig_tqdm = tqdm.tqdm
-    class ModelDownloadTqdm(_orig_tqdm):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self._last_reported_pct = -1
+    class DownloadProgressTqdm(tqdm.auto.tqdm):
+        _last_printed_pct = -1
 
         def update(self, n=1):
             super().update(n)
-            try:
-                if self.total and self.total > 5 * 1024 * 1024:
-                    pct = max(0, min(100, int((self.n / self.total) * 100)))
-                    if pct != self._last_reported_pct:
-                        self._last_reported_pct = pct
-                        print(f"[STATUS: Downloading AI Model {pct}%]", flush=True)
-                        print(f"[MODEL_DOWNLOAD_PROGRESS: {pct}]", flush=True)
-            except Exception:
-                pass
+            if self.total and self.total > 0:
+                pct = min(100, max(0, int(self.n * 100 / self.total)))
+                if pct != DownloadProgressTqdm._last_printed_pct:
+                    DownloadProgressTqdm._last_printed_pct = pct
+                    print(f"[MODEL_DOWNLOAD_PROGRESS: {pct}]", flush=True)
+                    print(f"[STATUS: Downloading AI Model {pct}%]", flush=True)
+except Exception:
+    class DownloadProgressTqdm:
+        _last_printed_pct = -1
+        def __init__(self, *args, **kwargs):
+            self.total = kwargs.get('total', 0) or 0
+            self.n = kwargs.get('initial', 0) or 0
+        def update(self, n=1):
+            self.n += n
+            if self.total > 0:
+                pct = min(100, max(0, int(self.n * 100 / self.total)))
+                if pct != DownloadProgressTqdm._last_printed_pct:
+                    DownloadProgressTqdm._last_printed_pct = pct
+                    print(f"[MODEL_DOWNLOAD_PROGRESS: {pct}]", flush=True)
+                    print(f"[STATUS: Downloading AI Model {pct}%]", flush=True)
+        def close(self):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
 
-    tqdm.tqdm = ModelDownloadTqdm
-    tqdm.auto.tqdm = ModelDownloadTqdm
+def is_model_complete(models_dir):
+    """Checks if the faster-whisper large-v3-turbo model is fully downloaded without corrupted or partial files."""
+    if not os.path.isdir(models_dir):
+        return False
+    # Check for any lingering .incomplete files
+    for root, _, files in os.walk(models_dir):
+        if any(f.endswith('.incomplete') or f.endswith('.tmp') for f in files):
+            return False
+    has_bin = False
+    has_config = False
+    for root, _, files in os.walk(models_dir):
+        for f in files:
+            if f == "model.bin":
+                try:
+                    if os.path.getsize(os.path.join(root, f)) >= 1400 * 1024 * 1024:
+                        has_bin = True
+                except Exception:
+                    pass
+            elif f == "config.json":
+                has_config = True
+    return has_bin and has_config
+
+def cleanup_partial_models(models_dir):
+    """Safely cleans up any temporary, incomplete, or corrupted model files."""
     try:
-        import huggingface_hub.utils.tqdm
-        huggingface_hub.utils.tqdm.tqdm = ModelDownloadTqdm
-        huggingface_hub.utils.tqdm.auto = ModelDownloadTqdm
+        if not os.path.isdir(models_dir):
+            return
+        # 1. Remove all .incomplete files
+        for root, dirs, files in os.walk(models_dir, topdown=False):
+            for f in files:
+                if f.endswith(".incomplete") or f.endswith(".tmp"):
+                    try:
+                        os.remove(os.path.join(root, f))
+                    except Exception:
+                        pass
+        # 2. Check if model is complete. If not, delete incomplete repo folder & locks
+        if not is_model_complete(models_dir):
+            repo_folder = os.path.join(models_dir, "models--mobiuslabsgmbh--faster-whisper-large-v3-turbo")
+            if os.path.isdir(repo_folder):
+                try:
+                    shutil.rmtree(repo_folder, ignore_errors=True)
+                except Exception:
+                    pass
+            locks_folder = os.path.join(models_dir, ".locks")
+            if os.path.isdir(locks_folder):
+                try:
+                    shutil.rmtree(locks_folder, ignore_errors=True)
+                except Exception:
+                    pass
+            cachedir_tag = os.path.join(models_dir, "CACHEDIR.TAG")
+            if os.path.exists(cachedir_tag):
+                try:
+                    os.remove(cachedir_tag)
+                except Exception:
+                    pass
     except Exception:
         pass
-    try:
-        import huggingface_hub.file_download
-        huggingface_hub.file_download.tqdm = ModelDownloadTqdm
-    except Exception:
-        pass
+
+_active_download_dir = None
+
+def _on_process_exit():
+    global _active_download_dir
+    if _active_download_dir:
+        cleanup_partial_models(_active_download_dir)
+
+import atexit
+atexit.register(_on_process_exit)
+
+def _term_signal_handler(signum, frame):
+    _on_process_exit()
+    sys.exit(1)
+
+import signal
+try:
+    signal.signal(signal.SIGINT, _term_signal_handler)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _term_signal_handler)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _term_signal_handler)
 except Exception:
     pass
+
+def ensure_ai_model(models_dir):
+    """
+    Verifies that the faster-whisper model is present.
+    If missing or incomplete, downloads with real 0-100% progress output.
+    Cleans up partial files on any error or network interruption.
+    """
+    global _active_download_dir
+    if is_model_complete(models_dir):
+        return True, None
+
+    _active_download_dir = models_dir
+    print("[STATUS: Downloading AI Model 0%]", flush=True)
+    print("[MODEL_DOWNLOAD_PROGRESS: 0]", flush=True)
+    DownloadProgressTqdm._last_printed_pct = -1
+
+    try:
+        import huggingface_hub
+        allow_patterns = [
+            "config.json",
+            "preprocessor_config.json",
+            "model.bin",
+            "tokenizer.json",
+            "vocabulary.*"
+        ]
+        huggingface_hub.snapshot_download(
+            "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+            cache_dir=models_dir,
+            allow_patterns=allow_patterns,
+            tqdm_class=DownloadProgressTqdm
+        )
+        if not is_model_complete(models_dir):
+            cleanup_partial_models(models_dir)
+            _active_download_dir = None
+            return False, "Download verification failed: model files incomplete."
+            
+        print("[MODEL_DOWNLOAD_PROGRESS: 100]", flush=True)
+        _active_download_dir = None
+        return True, None
+    except Exception as dl_err:
+        cleanup_partial_models(models_dir)
+        _active_download_dir = None
+        print(f"[DOWNLOAD_FAILED: NETWORK_LOST] Error: {dl_err}", flush=True)
+        return False, "Download failed: Network lost. Connect to internet to download again."
 
 try:
     from faster_whisper import WhisperModel
@@ -365,6 +490,7 @@ def generate_captions(config):
         max_gap_seconds = float(config.get("max_gap_seconds", 0.5))
         
         # 1. Extract trimmed audio
+        print("[STATUS: Extracting Audio...]", flush=True)
         print("[PROGRESS: 10]", flush=True)
         import tempfile, uuid
         
@@ -394,18 +520,12 @@ def generate_captions(config):
         print("[PROGRESS: 20]", flush=True)
         models_dir = os.path.join(SCRIPT_DIR, "models")
         
-        # Check if local model files already exist
-        has_local_model = False
-        if os.path.isdir(models_dir):
-            for root, _, files in os.walk(models_dir):
-                if any(f.endswith(".bin") for f in files):
-                    has_local_model = True
-                    break
-        
-        if not has_local_model:
-            print("[STATUS: Downloading AI Model 0%]", flush=True)
-            print("[MODEL_DOWNLOAD_PROGRESS: 0]", flush=True)
+        # Ensure model is fully downloaded and valid with live progress and network safety
+        model_ok, dl_err = ensure_ai_model(models_dir)
+        if not model_ok:
+            return {"error": dl_err or "AI model missing. Connect to internet to download."}
 
+        print("[STATUS: Loading AI Model...]", flush=True)
         print("[PROGRESS: 30]", flush=True)
         
         model_name = "large-v3-turbo"
@@ -414,29 +534,42 @@ def generate_captions(config):
         # 1. macOS: Use int8 CPU mode (AVX2/NEON vector optimized), fallback to default float32 if needed.
         # 2. Windows: Try CUDA float16 GPU mode first, fallback to CPU int8, and ultimate fallback to default float32.
         model = None
+        device_used = "cpu"
         try:
             if sys.platform == "darwin":
                 try:
                     model = WhisperModel(model_name, device="cpu", compute_type="int8", download_root=models_dir)
+                    device_used = "cpu (int8)"
                 except Exception:
                     model = WhisperModel(model_name, device="cpu", compute_type="default", download_root=models_dir)
+                    device_used = "cpu (default)"
             else:
                 try:
                     # Attempt GPU acceleration with float16 first
                     model = WhisperModel(model_name, device="cuda", compute_type="float16", download_root=models_dir)
-                except Exception:
+                    device_used = "cuda (float16)"
+                except Exception as cuda_err:
+                    print(f"[Device Notice] CUDA not available ({cuda_err}), falling back to CPU int8 mode", file=sys.stderr, flush=True)
                     try:
                         # Fallback to high-performance CPU int8 mode
                         print("[PROGRESS: 35]", flush=True)
                         model = WhisperModel(model_name, device="cpu", compute_type="int8", download_root=models_dir)
-                    except Exception:
+                        device_used = "cpu (int8)"
+                    except Exception as cpu_err:
                         # Ultimate safety fallback to CPU default
+                        print(f"[Device Notice] CPU int8 failed ({cpu_err}), falling back to CPU default mode", file=sys.stderr, flush=True)
                         model = WhisperModel(model_name, device="cpu", compute_type="default", download_root=models_dir)
+                        device_used = "cpu (default)"
         except Exception as model_err:
             err_str = str(model_err).lower()
-            if not has_local_model or any(k in err_str for k in ["huggingface", "connect", "network", "offline", "resolve", "http", "socket"]):
-                return {"error": "AI model missing. Connect to internet to download."}
+            cleanup_partial_models(models_dir)
+            if any(k in err_str for k in ["huggingface", "connect", "network", "offline", "resolve", "http", "socket"]):
+                return {"error": "Download failed: Network lost. Connect to internet to download again."}
             raise model_err
+
+        print(f"[Device Notice] Active compute device: {device_used}", file=sys.stderr, flush=True)
+        print("[STATUS: Transcribing...]", flush=True)
+        print("[PROGRESS: 40]", flush=True)
         
         transcribe_args = {"word_timestamps": True, "task": task, "condition_on_previous_text": False}
         if language != "auto":
@@ -453,7 +586,6 @@ def generate_captions(config):
         #     transcribe_args["patience"] = 1.0
         #     transcribe_args["length_penalty"] = 1.0
             
-        print("[PROGRESS: 40]", flush=True)
         # Prevent infinite loops but limit high temp to avoid random language hallucinations
         transcribe_args["temperature"] = [0.0, 0.2, 0.4]
         
@@ -475,8 +607,6 @@ def generate_captions(config):
         
         segments_generator, info = model.transcribe(temp_wav, **transcribe_args)
         
-        print("[PROGRESS: 50]", flush=True)
-        
         segments = []
         for segment in segments_generator:
             segments.append(segment)
@@ -484,6 +614,7 @@ def generate_captions(config):
             if duration > 0:
                 progress_fraction = min(1.0, segment.end / duration)
                 current_pct = 40 + int(progress_fraction * 40)
+                print(f"[STATUS: Transcribing {current_pct}%]", flush=True)
                 print(f"[PROGRESS: {current_pct}]", flush=True)
         
         # Post-process: clean foreign script leaks from Hindi transcription
@@ -745,12 +876,24 @@ def generate_captions(config):
                     break # Success on this model, break out of fallback loop
                 except urllib.error.HTTPError as e:
                     print(f"[STATUS: Model {attempt_model} API error ({e.code}), retrying...]", flush=True)
+                    try:
+                        err_body = e.read().decode('utf-8')
+                        sys.stderr.write(f"[Gemini API Error] {e.code}: {err_body}\n")
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
                     continue
                 except urllib.error.URLError as e:
                     print(f"[STATUS: Network unreachable, aborting AI Grammar Corrector...]", flush=True)
+                    sys.stderr.write(f"[Gemini Network Error] {str(e)}\n")
+                    sys.stderr.flush()
                     break
                 except Exception as e:
                     print(f"[STATUS: Model {attempt_model} failed, retrying...]", flush=True)
+                    sys.stderr.write(f"[Gemini Error] {type(e).__name__}: {str(e)}\n")
+                    import traceback
+                    traceback.print_exc(file=sys.stderr)
+                    sys.stderr.flush()
                     continue
                     
             if not success_ai:
@@ -758,6 +901,7 @@ def generate_captions(config):
 
 
         # 3. Process captions
+        print("[STATUS: Processing Text...]", flush=True)
         print("[PROGRESS: 80]", flush=True)
         raw_words = []
         for segment in segments:
@@ -851,10 +995,15 @@ def generate_captions(config):
                 if w['end'] <= w['start']:
                     w['end'] = w['start'] + 0.1
 
+        print("[STATUS: Formatting Captions...]", flush=True)
         print("[PROGRESS: 90]", flush=True)
         if transliterate_to_english and not gemini_handled_hinglish:
-            def devanagari_to_hinglish_batch(words):
-                import urllib.request, json, urllib.parse, difflib, string
+            def has_devanagari(text):
+                return any('\u0900' <= c <= '\u097F' for c in text)
+
+            # Only run transliteration if there are actually Devanagari characters
+            if any(has_devanagari(w['word']) for w in raw_words):
+                import urllib.request, urllib.parse, difflib, string
                 
                 consonants = {
                     'क':'k', 'ख':'kh', 'ग':'g', 'घ':'gh', 'ङ':'n',
@@ -910,92 +1059,101 @@ def generate_captions(config):
                     return " ".join(out_words)
                 
                 def fetch_api(chunk_words):
-                    text = "\n \n".join(chunk_words)
-                    try:
-                        req = urllib.request.Request('https://translate.googleapis.com/translate_a/single?client=gtx&sl=hi&tl=en&dt=rm&dt=t&q=' + urllib.parse.quote(text))
-                        req.add_header('User-Agent', 'Mozilla/5.0')
-                        res = urllib.request.urlopen(req, timeout=5, context=get_ssl_context())
-                        data = json.loads(res.read().decode('utf-8'))
-                        
-                        translations = []
-                        romanization = ""
-                        
-                        if data and len(data) > 0 and data[0]:
-                            for chunk in data[0]:
-                                if chunk[0] is not None:
-                                    translations.append(chunk[0].strip())
-                                if len(chunk) > 3 and chunk[3]:
-                                    romanization += chunk[3]
-                        
-                        if romanization:
-                            rom_words = [w.strip() for w in romanization.split('\n') if w.strip()]
-                            trans_words = [w.strip() for w in "\n".join(translations).split('\n') if w.strip()]
-                            
-                            if len(rom_words) == len(chunk_words):
-                                final_words = []
-                                for i, rom_word in enumerate(rom_words):
-                                    if i < len(trans_words):
-                                        trans_word = trans_words[i]
-                                        similarity = difflib.SequenceMatcher(None, rom_word.lower(), trans_word.lower()).ratio()
-                                        if similarity > 0.5:
-                                            final_words.append(trans_word)
-                                            continue
-                                    final_words.append(rom_word)
-                                return final_words
-                    except Exception:
-                        pass
+                    text = " | ".join(chunk_words)
+                    quoted_text = urllib.parse.quote(text)
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                    }
+                    
+                    clients = ['gtx', 'dict-chrome-ex']
+                    for client in clients:
+                        try:
+                            url = f'https://translate.googleapis.com/translate_a/single?client={client}&sl=hi&tl=en&dt=rm&dt=t&q={quoted_text}'
+                            req = urllib.request.Request(url, headers=headers)
+                            with urllib.request.urlopen(req, timeout=5.0, context=get_ssl_context()) as res:
+                                data = json.loads(res.read().decode('utf-8'))
+                                
+                            romanization = ""
+                            if data and len(data) > 0 and data[0]:
+                                for c in data[0]:
+                                    if len(c) > 3 and c[3]:
+                                        romanization += c[3]
+                                        
+                            if romanization and '|' in romanization:
+                                parts = [p.strip() for p in romanization.split('|')]
+                                if len(parts) == len(chunk_words):
+                                    return parts
+                            elif len(chunk_words) == 1 and romanization:
+                                return [romanization.strip()]
+                        except Exception:
+                            continue
                     return None
-                    
-                final_results = []
-                chunk_size = 25
-                for i in range(0, len(words), chunk_size):
-                    chunk = words[i:i+chunk_size]
-                    res = fetch_api(chunk)
-                    if res:
-                        final_results.extend(res)
-                    else:
-                        for word in chunk:
-                            single_res = fetch_api([word])
-                            if single_res:
-                                final_results.extend(single_res)
-                            else:
-                                final_results.append(fallback_trans(word))
-                return final_results
 
-            # Batch process all words
-            import string
-            punct = string.punctuation + '।॥|'
-            clean_words = []
-            prefixes = []
-            suffixes = []
-            
-            for w in raw_words:
-                w_str = w['word'].strip()
-                clean_w = w_str.strip(punct)
-                
-                if not clean_w:
-                    clean_words.append("a") # Dummy word to preserve length
-                    prefixes.append("")
-                    suffixes.append(w_str.replace('।', '.').replace('॥', '.').replace('|', '.'))
-                    continue
+                punct = string.punctuation + '।॥|'
+                clean_words = []
+                prefixes = []
+                suffixes = []
+                devanagari_indices = []
+                devanagari_query_words = []
+
+                for i, w in enumerate(raw_words):
+                    w_str = w['word'].strip()
+                    clean_w = w_str.strip(punct)
                     
-                idx = w_str.find(clean_w)
-                prefix = w_str[:idx].replace('।', '.').replace('॥', '.').replace('|', '.')
-                suffix = w_str[idx+len(clean_w):].replace('।', '.').replace('॥', '.').replace('|', '.')
-                
-                clean_words.append(clean_w)
-                prefixes.append(prefix)
-                suffixes.append(suffix)
-                
-            hinglish_clean = devanagari_to_hinglish_batch(clean_words)
-            
-            for i, w in enumerate(raw_words):
-                if clean_words[i] == "a" and len(hinglish_clean) == len(raw_words):
-                    w['word'] = suffixes[i]
-                else:
-                    try:
-                        w['word'] = prefixes[i] + hinglish_clean[i] + suffixes[i]
-                    except Exception:
+                    if not clean_w:
+                        clean_words.append("")
+                        prefixes.append("")
+                        suffixes.append(w_str.replace('।', '.').replace('॥', '.').replace('|', '.'))
+                        continue
+                        
+                    idx = w_str.find(clean_w)
+                    prefix = w_str[:idx].replace('।', '.').replace('॥', '.').replace('|', '.')
+                    suffix = w_str[idx+len(clean_w):].replace('।', '.').replace('॥', '.').replace('|', '.')
+                    
+                    clean_words.append(clean_w)
+                    prefixes.append(prefix)
+                    suffixes.append(suffix)
+
+                    if has_devanagari(clean_w):
+                        devanagari_indices.append(i)
+                        devanagari_query_words.append(clean_w)
+
+                if devanagari_query_words:
+                    chunk_size = 20
+                    dev_results = []
+                    for c_idx in range(0, len(devanagari_query_words), chunk_size):
+                        chunk = devanagari_query_words[c_idx:c_idx+chunk_size]
+                        res = fetch_api(chunk)
+                        if res and len(res) == len(chunk):
+                            dev_results.extend(res)
+                        else:
+                            # Sub-chunk retry with 5-word chunks for 100% precision
+                            sub_ok = True
+                            sub_res = []
+                            sub_size = 5
+                            for s_idx in range(0, len(chunk), sub_size):
+                                schunk = chunk[s_idx:s_idx+sub_size]
+                                sres = fetch_api(schunk)
+                                if sres and len(sres) == len(schunk):
+                                    sub_res.extend(sres)
+                                else:
+                                    sub_ok = False
+                                    break
+                            if sub_ok and len(sub_res) == len(chunk):
+                                dev_results.extend(sub_res)
+                            else:
+                                # Instant offline rule-based phonetic fallback if network fails
+                                dev_results.extend([fallback_trans(cw) for cw in chunk])
+
+                    for mapped_idx, orig_i in enumerate(devanagari_indices):
+                        if mapped_idx < len(dev_results):
+                            clean_words[orig_i] = dev_results[mapped_idx]
+
+                for i, w in enumerate(raw_words):
+                    if not clean_words[i]:
+                        w['word'] = suffixes[i]
+                    else:
                         w['word'] = prefixes[i] + clean_words[i] + suffixes[i]
         # Chunk words
         captions = []
@@ -1086,6 +1244,8 @@ def main():
     result = generate_captions(config)
     
     if "error" not in result:
+        print("[STATUS: Finishing...]", flush=True)
+        print("[PROGRESS: 100]", flush=True)
         output_json = config.get("output_json")
         if output_json:
             with open(output_json, 'w', encoding='utf-8') as f:
