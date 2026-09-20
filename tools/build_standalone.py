@@ -13,7 +13,12 @@ TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_PATH = os.path.join(TOOLS_DIR, "generate_captions.py")
 IS_MAC = sys.platform == "darwin"
 
-ENGINE_DIR = os.path.join(TOOLS_DIR, "mac", "engine") if IS_MAC else os.path.join(TOOLS_DIR, "win", "engine")
+if IS_MAC:
+    import platform
+    mac_arch = "arm64" if platform.machine().lower() in ["arm64", "aarch64"] else "x64"
+    ENGINE_DIR = os.path.join(TOOLS_DIR, "mac", f"engine_{mac_arch}")
+else:
+    ENGINE_DIR = os.path.join(TOOLS_DIR, "win", "engine")
 BUILD_DIR = os.path.join(TOOLS_DIR, "_build_tmp")
 DIST_DIR = os.path.join(TOOLS_DIR, "_dist_tmp")
 SPEC_PATH = os.path.join(TOOLS_DIR, "generate_captions.spec")
