@@ -70,6 +70,27 @@ else:
                     pass
 warnings.filterwarnings("ignore")
 
+def is_cuda_usable():
+    """Verify if NVIDIA CUDA GPU acceleration runtime (e.g. cuBLAS DLLs) is truly present and loadable."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() == 0:
+            return False
+    except Exception:
+        return False
+
+    import ctypes
+    # Check if cuBLAS 12 or 11 can actually be loaded
+    for dll_name in ["cublas64_12.dll", "cublas64_11.dll"]:
+        try:
+            ctypes.CDLL(dll_name)
+            return True
+        except Exception:
+            pass
+    return False
+
 def get_ssl_context():
     """Returns a robust SSL context using certifi or OS root certificates across Windows and macOS."""
     import ssl
@@ -532,7 +553,7 @@ def generate_captions(config):
         
         # Performance optimization with multi-tier resilience:
         # 1. macOS: Use int8 CPU mode (AVX2/NEON vector optimized), fallback to default float32 if needed.
-        # 2. Windows: Try CUDA float16 GPU mode first, fallback to CPU int8, and ultimate fallback to default float32.
+        # 2. Windows: Try CUDA float16 GPU mode ONLY if CUDA runtime DLLs are usable, fallback to CPU int8, and ultimate fallback to default float32.
         model = None
         device_used = "cpu"
         try:
@@ -544,15 +565,19 @@ def generate_captions(config):
                     model = WhisperModel(model_name, device="cpu", compute_type="default", download_root=models_dir)
                     device_used = "cpu (default)"
             else:
-                try:
-                    # Attempt GPU acceleration with float16 first
-                    model = WhisperModel(model_name, device="cuda", compute_type="float16", download_root=models_dir)
-                    device_used = "cuda (float16)"
-                except Exception as cuda_err:
-                    print(f"[Device Notice] CUDA not available ({cuda_err}), falling back to CPU int8 mode", file=sys.stderr, flush=True)
+                cuda_available = is_cuda_usable()
+                if cuda_available:
+                    try:
+                        # Attempt GPU acceleration with float16 first
+                        model = WhisperModel(model_name, device="cuda", compute_type="float16", download_root=models_dir)
+                        device_used = "cuda (float16)"
+                    except Exception as cuda_err:
+                        print(f"[Device Notice] CUDA initialization failed ({cuda_err}), falling back to CPU mode", file=sys.stderr, flush=True)
+                        cuda_available = False
+                
+                if not cuda_available:
                     try:
                         # Fallback to high-performance CPU int8 mode
-                        print("[PROGRESS: 35]", flush=True)
                         model = WhisperModel(model_name, device="cpu", compute_type="int8", download_root=models_dir)
                         device_used = "cpu (int8)"
                     except Exception as cpu_err:
@@ -605,17 +630,35 @@ def generate_captions(config):
         # Re-enable hallucination drop logic to prevent infinite repeating loops during pauses
         transcribe_args["hallucination_silence_threshold"] = 2.0
         
-        segments_generator, info = model.transcribe(temp_wav, **transcribe_args)
-        
-        segments = []
-        for segment in segments_generator:
-            segments.append(segment)
-            # Safely calculate progress between 40% and 80%
-            if duration > 0:
-                progress_fraction = min(1.0, segment.end / duration)
-                current_pct = 40 + int(progress_fraction * 40)
-                print(f"[STATUS: Transcribing {current_pct}%]", flush=True)
-                print(f"[PROGRESS: {current_pct}]", flush=True)
+        def _execute_transcription(active_model):
+            seg_gen, inf = active_model.transcribe(temp_wav, **transcribe_args)
+            collected_segments = []
+            for segment in seg_gen:
+                collected_segments.append(segment)
+                # Safely calculate progress between 40% and 80%
+                if duration > 0:
+                    progress_fraction = min(1.0, segment.end / duration)
+                    current_pct = 40 + int(progress_fraction * 40)
+                    print(f"[PROGRESS: {current_pct}]", flush=True)
+            return collected_segments, inf
+
+        try:
+            segments, info = _execute_transcription(model)
+        except Exception as transcribe_err:
+            err_msg = str(transcribe_err).lower()
+            if "cuda" in device_used and any(k in err_msg for k in ["cuda", "cublas", "cudnn", "out of memory", "not found", "cannot be loaded", "driver"]):
+                print(f"[Device Notice] CUDA transcription failed ({transcribe_err}), seamlessly switching to CPU fallback...", file=sys.stderr, flush=True)
+                print("[STATUS: Switching to CPU...]", flush=True)
+                try:
+                    model = WhisperModel(model_name, device="cpu", compute_type="int8", download_root=models_dir)
+                    device_used = "cpu (int8)"
+                except Exception:
+                    model = WhisperModel(model_name, device="cpu", compute_type="default", download_root=models_dir)
+                    device_used = "cpu (default)"
+                print(f"[Device Notice] Active compute device: {device_used}", file=sys.stderr, flush=True)
+                segments, info = _execute_transcription(model)
+            else:
+                raise transcribe_err
         
         # Post-process: clean foreign script leaks from Hindi transcription
         detected_lang = info.language if info and hasattr(info, 'language') else language
@@ -891,7 +934,6 @@ def generate_captions(config):
                 except Exception as e:
                     print(f"[STATUS: Model {attempt_model} failed, retrying...]", flush=True)
                     sys.stderr.write(f"[Gemini Error] {type(e).__name__}: {str(e)}\n")
-                    import traceback
                     traceback.print_exc(file=sys.stderr)
                     sys.stderr.flush()
                     continue
