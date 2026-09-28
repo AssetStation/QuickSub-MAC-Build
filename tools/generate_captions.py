@@ -117,6 +117,48 @@ def get_ssl_context():
     except Exception:
         return ssl._create_unverified_context()
 
+def get_system_machine_guid():
+    import platform
+    try:
+        if platform.system() == 'Windows':
+            reg_out = subprocess.check_output(['reg', 'query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid'], stderr=subprocess.DEVNULL)
+            import re
+            match = re.search(r'MachineGuid\s+REG_SZ\s+([a-zA-Z0-9-]+)', reg_out.decode(), re.IGNORECASE)
+            return "".join(c for c in match.group(1) if c.isalnum()) if match else ""
+        else:
+            out = subprocess.check_output("ioreg -rd1 -c IOPlatformExpertDevice | awk '/IOPlatformUUID/ { split($0, line, \"\\\"\"); printf(\"%s\\n\", line[4]); }'", shell=True, stderr=subprocess.DEVNULL)
+            return "".join(c for c in out.decode().strip() if c.isalnum())
+    except Exception:
+        return ""
+
+def unseal_device_identity():
+    import platform
+    import hashlib
+    try:
+        if platform.system() == 'Darwin':
+            cache_dir = os.path.expanduser('~/Library/Application Support/QuickSubPro')
+        else:
+            cache_dir = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'QuickSubPro')
+        file_path = os.path.join(cache_dir, '.device_identity')
+        if not os.path.exists(file_path):
+            return ""
+        guid = get_system_machine_guid()
+        if not guid:
+            return ""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+        if not raw.get('iv') or not raw.get('tag') or not raw.get('data'):
+            return ""
+        key = hashlib.pbkdf2_hmac('sha256', guid.encode('utf-8'), b'QS_CACHE_SALT_#8492_PRO', 2000, 32)
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        aesgcm = AESGCM(key)
+        ciphertext = bytes.fromhex(raw['data']) + bytes.fromhex(raw['tag'])
+        iv = bytes.fromhex(raw['iv'])
+        decrypted = aesgcm.decrypt(iv, ciphertext, None)
+        return decrypted.decode('utf-8').strip()
+    except Exception:
+        return ""
+
 def get_hardware_id():
     import platform
     try:
@@ -125,19 +167,25 @@ def get_hardware_id():
             hwid = "".join(c for c in out.decode().strip() if c.isalnum())
             is_generic = not hwid or len(hwid) < 3 or hwid.lower() in ['none', 'default', 'tobedefined', 'tobefilled', '0'] or hwid.lower().startswith('unknown')
             if is_generic:
-                reg_out = subprocess.check_output(['reg', 'query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid'], stderr=subprocess.DEVNULL)
-                import re
-                match = re.search(r'MachineGuid\s+REG_SZ\s+([a-zA-Z0-9-]+)', reg_out.decode(), re.IGNORECASE)
-                if match:
-                    hwid = "".join(c for c in match.group(1) if c.isalnum())
+                guid = get_system_machine_guid()
+                if guid and len(guid) >= 4:
+                    hwid = guid
             if not hwid or len(hwid) < 4:
-                hwid = 'WIN_' + os.environ.get('COMPUTERNAME', 'DEVICE')
+                unsealed = unseal_device_identity()
+                if unsealed and len(unsealed) >= 4:
+                    hwid = unsealed
+                else:
+                    hwid = 'WIN_' + os.environ.get('COMPUTERNAME', 'DEVICE')
             return hwid
         else:
             out = subprocess.check_output("ioreg -rd1 -c IOPlatformExpertDevice | awk '/IOPlatformUUID/ { split($0, line, \"\\\"\"); printf(\"%s\\n\", line[4]); }'", shell=True, stderr=subprocess.DEVNULL)
             hwid = "".join(c for c in out.decode().strip() if c.isalnum())
             if not hwid or len(hwid) < 4:
-                hwid = 'MAC_' + os.environ.get('USER', 'DEVICE')
+                unsealed = unseal_device_identity()
+                if unsealed and len(unsealed) >= 4:
+                    hwid = unsealed
+                else:
+                    hwid = 'MAC_' + os.environ.get('USER', 'DEVICE')
             return hwid
     except Exception:
         return 'WIN_' + os.environ.get('COMPUTERNAME', 'DEVICE') if platform.system() == 'Windows' else 'MAC_' + os.environ.get('USER', 'DEVICE')
@@ -175,7 +223,7 @@ def load_license_cache(hwid):
             except Exception:
                 pass
 
-        # Case B: Legacy XOR format
+        # Case B: Legacy XOR format (one-time migration support)
         text = ""
         for i in range(0, len(raw), 2):
             char_code = int(raw[i:i+2], 16) ^ ord(hwid[(i//2) % len(hwid)])
@@ -211,23 +259,34 @@ def verify_execution_session(config):
     if not cache:
         return {"valid": False, "error": "Please activate a valid QuickSub Pro license."}
 
-    # If modern v2 cache with entanglement_seed
+    # Strict cryptographic seed verification (eliminating legacy unverified bypass)
     seed = cache.get("entanglement_seed")
-    if seed:
-        b = bucket if bucket is not None else int(time.time() // (60 * 15))
+    if not seed:
+        return {"valid": False, "error": "License session corrupted. Please reactivate your license in settings."}
+
+    # Validate against current, adjacent, and declared 15-minute sliding window buckets
+    current_bucket = int(time.time() // (60 * 15))
+    valid = False
+    candidates = [current_bucket, current_bucket - 1, current_bucket + 1]
+    if bucket is not None and bucket not in candidates:
+        candidates.append(bucket)
+
+    for b in candidates:
         data = f"{hwid}:{b}:QuickSub Pro".encode('utf-8')
         expected_token = hmac.new(seed.encode('utf-8'), data, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected_token, token):
-            return {"valid": False, "error": "License verification failed. Please reactivate your license in settings."}
-        return {"valid": True}
+        if hmac.compare_digest(expected_token, token):
+            valid = True
+            break
 
-    # Legacy 7-day fallback for offline migration
-    if cache.get("gumroad_key") and cache.get("plugin_name") == "QuickSub Pro":
-        cache_date = cache.get("cache_date")
-        if cache_date and ((time.time() * 1000) - cache_date < 7 * 24 * 60 * 60 * 1000):
-            return {"valid": True}
+    if not valid:
+        return {"valid": False, "error": "License verification failed. Please reactivate your license in settings."}
 
-    return {"valid": False, "error": "License verification failed. Please reactivate your license in settings."}
+    # Anti-Clock Rollback check in Python:
+    cache_date = cache.get("cache_date")
+    if cache_date and (cache_date > now_ms + 180000 or now_ms - cache_date < -180000):
+        return {"valid": False, "error": "System clock anomaly detected. Please ensure your clock is set correctly."}
+
+    return {"valid": True}
 
 
 
