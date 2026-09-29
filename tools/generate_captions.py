@@ -719,9 +719,9 @@ def generate_captions(config):
             else:
                 raise transcribe_err
         
-        # Post-process: clean foreign script leaks from Hindi transcription
+        # Post-process: clean foreign script leaks from Hindi and Marathi transcription
         detected_lang = info.language if info and hasattr(info, 'language') else language
-        if detected_lang == "hi":
+        if detected_lang in ["hi", "mr"]:
             import re, unicodedata
             def clean_hindi_segment(text):
                 """Normalize Unicode (NFC) and remove foreign script characters (Arabic, Greek, Hebrew, Armenian, etc.) 
