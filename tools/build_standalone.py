@@ -194,9 +194,74 @@ def build_standalone(include_cuda=False):
         print(f"[OK] Total engine folder size: {size_mb:.1f} MB (Executable: {os.path.basename(exe_path)})")
     print("=" * 60)
 
+def build_with_nuitka(include_cuda=False):
+    print("=" * 60)
+    print("QuickSub Pro - Nuitka Native C Machine-Code Compiler")
+    print(f"Target OS: {'macOS' if IS_MAC else 'Windows'}")
+    print(f"Engine Output Directory: {ENGINE_DIR}")
+    print("=" * 60)
+
+    try:
+        subprocess.run([sys.executable, "-m", "nuitka", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except Exception:
+        print("[*] Installing Nuitka and dependencies for native C compilation...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "nuitka", "zstandard"], check=True)
+
+    for p in [BUILD_DIR, DIST_DIR]:
+        if os.path.exists(p):
+            shutil.rmtree(p, ignore_errors=True)
+
+    cmd = [
+        sys.executable, "-m", "nuitka",
+        "--standalone",
+        "--assume-yes-for-downloads",
+        f"--output-dir={DIST_DIR}",
+        "--include-package=ctranslate2",
+        "--include-package=faster_whisper",
+        "--include-package=tokenizers",
+        "--include-package=huggingface_hub",
+        "--include-package=tqdm",
+        "--include-package=onnxruntime",
+        "--include-package=cryptography",
+        "--include-package=certifi",
+        "--no-prefer-source-code",
+    ]
+    if not IS_MAC:
+        cmd.append("--windows-console-mode=disable")
+    cmd.append(SCRIPT_PATH)
+
+    print(f"[*] Running Nuitka command:\n{' '.join(cmd)}\n")
+    proc = subprocess.run(cmd)
+    if proc.returncode != 0:
+        print(f"\n[!] Nuitka build failed with exit code {proc.returncode}")
+        sys.exit(proc.returncode)
+
+    built_engine_src = os.path.join(DIST_DIR, "generate_captions.dist")
+    if not os.path.isdir(built_engine_src):
+        built_engine_src = os.path.join(DIST_DIR, "generate_captions")
+    if not os.path.isdir(built_engine_src):
+        print(f"[!] Nuitka output directory not found in {DIST_DIR}")
+        sys.exit(1)
+
+    if os.path.exists(ENGINE_DIR):
+        shutil.rmtree(ENGINE_DIR, ignore_errors=True)
+    os.makedirs(os.path.dirname(ENGINE_DIR), exist_ok=True)
+    shutil.move(built_engine_src, ENGINE_DIR)
+
+    for p in [BUILD_DIR, DIST_DIR]:
+        if os.path.exists(p):
+            shutil.rmtree(p, ignore_errors=True)
+
+    print("\n" + "=" * 60)
+    print(f"[OK] Standalone native machine-code engine built at:\n    {ENGINE_DIR}")
+    print("=" * 60)
+
 if __name__ == "__main__":
     if "--package-cuda-zip" in sys.argv:
         package_cuda_zip()
+    elif "--nuitka" in sys.argv:
+        inc_cuda = "--include-cuda" in sys.argv
+        build_with_nuitka(include_cuda=inc_cuda)
     else:
         inc_cuda = "--include-cuda" in sys.argv
         build_standalone(include_cuda=inc_cuda)

@@ -177,6 +177,14 @@ def get_hardware_id():
                 guid = get_system_machine_guid()
                 if guid and len(guid) >= 4:
                     hwid = guid
+                else:
+                    try:
+                        cpu_disk = subprocess.check_output(['powershell', '-NoProfile', '-Command', '(Get-CimInstance Win32_Processor).ProcessorId; (Get-CimInstance Win32_DiskDrive | Select-Object -First 1).SerialNumber'], stderr=subprocess.DEVNULL)
+                        lines = ["".join(c for c in l if c.isalnum()) for l in cpu_disk.decode().splitlines() if l.strip()]
+                        if lines:
+                            hwid = hashlib.sha256(":".join(lines).encode('utf-8')).hexdigest()[:32].upper()
+                    except Exception:
+                        pass
             if not hwid or len(hwid) < 4:
                 unsealed = unseal_device_identity()
                 if unsealed and len(unsealed) >= 4:
@@ -353,6 +361,13 @@ def verify_execution_session(config):
     signed_is_trial = bool(payload.get("is_trial") or str(payload.get("license_key") or "").startswith("TRIAL-"))
     cache_is_trial = bool(cache.get("is_trial") or license_key.startswith("TRIAL-"))
     is_trial = signed_is_trial or cache_is_trial
+
+    # Strict 14-day cumulative maximum offline limit (Anti-Revocation Bypass)
+    if not is_trial:
+        MAX_OFFLINE_GRACE_MS = 14 * 24 * 60 * 60 * 1000
+        last_verified = cache.get("last_online_verified") or cache.get("cache_date") or 0
+        if last_verified > 0 and (now_ms - last_verified) > MAX_OFFLINE_GRACE_MS:
+            return {"valid": False, "error": "Offline grace period (14 days) reached. Please connect to the internet to verify your license."}
 
     # Cryptographically verified expiration is primary source of truth:
     exp_str = payload.get("exp") or cache.get("expiration_date")
@@ -1577,6 +1592,16 @@ def main():
     if not session_check.get("valid"):
         print(json.dumps({"error": session_check.get("error", "Please activate a valid QuickSub Pro license.")}))
         sys.exit(1)
+
+    try:
+        # Sanitize single-use session handshake from temporary config file on disk
+        if "security_handshake" in config:
+            cleaned_conf = dict(config)
+            del cleaned_conf["security_handshake"]
+            with open(config_path, 'w', encoding='utf-8') as sf:
+                json.dump(cleaned_conf, sf)
+    except Exception:
+        pass
         
     result = generate_captions(config)
     
