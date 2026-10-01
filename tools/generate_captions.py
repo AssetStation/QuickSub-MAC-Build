@@ -117,6 +117,11 @@ def get_ssl_context():
     except Exception:
         return ssl._create_unverified_context()
 
+PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFXqgmcQCRgBFT0fyOYPlztPAYvpU
+cXpHytneusbAk74qfrmdBIA8UZXb2bKO1yiE7ce5kF2UJk9ErPqzbRHYxQ==
+-----END PUBLIC KEY-----"""
+
 def get_system_machine_guid():
     import platform
     try:
@@ -165,7 +170,9 @@ def get_hardware_id():
         if platform.system() == 'Windows':
             out = subprocess.check_output(['powershell', '-NoProfile', '-Command', '(Get-CimInstance Win32_BaseBoard).SerialNumber'], stderr=subprocess.DEVNULL)
             hwid = "".join(c for c in out.decode().strip() if c.isalnum())
-            is_generic = not hwid or len(hwid) < 3 or hwid.lower() in ['none', 'default', 'tobedefined', 'tobefilled', '0'] or hwid.lower().startswith('unknown')
+            is_zeroes = all(c == '0' for c in hwid) if hwid else False
+            is_placeholder = any(hwid.lower().startswith(p) for p in ['none', 'default', 'tobedefined', 'tobefilled', 'baseboard', 'unknown']) if hwid else False
+            is_generic = not hwid or len(hwid) < 3 or is_zeroes or is_placeholder
             if is_generic:
                 guid = get_system_machine_guid()
                 if guid and len(guid) >= 4:
@@ -233,6 +240,27 @@ def load_license_cache(hwid):
     except Exception:
         return None
 
+def get_os_monotonic_watermark():
+    import platform
+    if platform.system() == 'Windows':
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\QuickSubPro")
+            val, _ = winreg.QueryValueEx(key, "LastActiveWatermark")
+            winreg.CloseKey(key)
+            return int(val)
+        except Exception:
+            return 0
+    else:
+        try:
+            wm_path = os.path.expanduser('~/.quicksub_wm')
+            if os.path.exists(wm_path):
+                with open(wm_path, 'r', encoding='utf-8') as f:
+                    return int(f.read().strip())
+        except Exception:
+            return 0
+    return 0
+
 def verify_execution_session(config):
     import time
     import hmac
@@ -259,6 +287,34 @@ def verify_execution_session(config):
     if not cache:
         return {"valid": False, "error": "Please activate a valid QuickSub Pro license."}
 
+    # Strict ECDSA P-256 signature verification (ensuring genuine Supabase signed lease)
+    signed_payload_str = cache.get("signed_payload")
+    signature_hex = cache.get("signature")
+    if not signed_payload_str or not signature_hex:
+        return {"valid": False, "error": "License verification failed: unauthenticated or corrupted session."}
+
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+
+        pub_key = serialization.load_pem_public_key(PUBLIC_KEY_PEM.encode('utf-8'))
+        sig_bytes = bytes.fromhex(signature_hex)
+        if len(sig_bytes) != 64:
+            return {"valid": False, "error": "License verification failed: invalid signature format."}
+        r = int.from_bytes(sig_bytes[:32], 'big')
+        s = int.from_bytes(sig_bytes[32:], 'big')
+        der_sig = encode_dss_signature(r, s)
+        pub_key.verify(der_sig, signed_payload_str.encode('utf-8'), ec.ECDSA(hashes.SHA256()))
+
+        payload = json.loads(signed_payload_str)
+        if payload.get("product") != "QuickSub Pro":
+            return {"valid": False, "error": "This license is not valid for QuickSub Pro."}
+        if payload.get("hwid") != hwid:
+            return {"valid": False, "error": "This license is already active on another device."}
+    except Exception:
+        return {"valid": False, "error": "License verification failed: cryptographic signature untrusted or tampered."}
+
     # Strict cryptographic seed verification (eliminating legacy unverified bypass)
     seed = cache.get("entanglement_seed")
     if not seed:
@@ -281,12 +337,56 @@ def verify_execution_session(config):
     if not valid:
         return {"valid": False, "error": "License verification failed. Please reactivate your license in settings."}
 
-    # Anti-Clock Rollback check in Python:
+    # Anti-Clock Rollback check in Python (Dual-Layer Monotonic Watermark):
     cache_date = cache.get("cache_date")
+    last_active = cache.get("last_active_timestamp") or cache_date
+    os_watermark = get_os_monotonic_watermark()
+    highest_watermark = max(last_active or 0, os_watermark or 0)
+
     if cache_date and (cache_date > now_ms + 180000 or now_ms - cache_date < -180000):
         return {"valid": False, "error": "System clock anomaly detected. Please ensure your clock is set correctly."}
+    if highest_watermark > 0 and (highest_watermark - now_ms > 60000):
+        return {"valid": False, "error": "System clock anomaly detected. Please ensure your clock is set correctly."}
+
+    # Strict Expiration Enforcement (Zero Grace for 7-Day Free Trials):
+    license_key = str(cache.get("gumroad_key") or "")
+    signed_is_trial = bool(payload.get("is_trial") or str(payload.get("license_key") or "").startswith("TRIAL-"))
+    cache_is_trial = bool(cache.get("is_trial") or license_key.startswith("TRIAL-"))
+    is_trial = signed_is_trial or cache_is_trial
+
+    # Cryptographically verified expiration is primary source of truth:
+    exp_str = payload.get("exp") or cache.get("expiration_date")
+
+    if is_trial and not exp_str:
+        return {"valid": False, "error": "Invalid trial expiration data. Please reactivate your trial in settings."}
+
+    if exp_str:
+        import datetime
+        try:
+            cleaned_exp = exp_str.replace("Z", "+00:00") if str(exp_str).endswith("Z") else str(exp_str)
+            if "T" in cleaned_exp:
+                exp_dt = datetime.datetime.fromisoformat(cleaned_exp)
+            else:
+                exp_dt = datetime.datetime.strptime(cleaned_exp.split()[0], "%Y-%m-%d")
+                exp_dt = exp_dt.replace(hour=23, minute=59, second=59, tzinfo=datetime.timezone.utc)
+
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
+
+            now_dt = datetime.datetime.now(datetime.timezone.utc)
+            grace_seconds = 0 if is_trial else (48 * 3600)
+
+            if (now_dt.timestamp() - exp_dt.timestamp()) > grace_seconds:
+                if is_trial:
+                    return {"valid": False, "error": "Your 7-day QuickSub Pro trial has expired. Please activate a full license."}
+                else:
+                    return {"valid": False, "error": "Your QuickSub Pro license lease has expired. Please renew in settings."}
+        except Exception:
+            if is_trial:
+                return {"valid": False, "error": "Corrupted trial expiration timestamp. Please reactivate your trial."}
 
     return {"valid": True}
+
 
 
 
@@ -488,15 +588,28 @@ def extract_audio(input_file, start_time, duration, output_wav):
         "-ss", str(start_time),
         "-t", str(duration),
         "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+        "-af", "highpass=f=60,lowpass=f=7500",
         output_wav
     ]
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         return True
-    except subprocess.CalledProcessError as e:
-        print(f"FFmpeg extraction failed: {e.stderr.decode('utf-8', errors='ignore')}", file=sys.stderr)
-        return False
+    except subprocess.CalledProcessError:
+        # Automatic safety fallback without audio filter in case ffmpeg version or format rejects filter
+        cmd_fallback = [
+            ffmpeg_exe, "-y",
+            "-i", input_file,
+            "-ss", str(start_time),
+            "-t", str(duration),
+            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            output_wav
+        ]
+        try:
+            subprocess.run(cmd_fallback, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            return True
+        except Exception as e:
+            print(f"FFmpeg extraction fallback failed: {str(e)}", file=sys.stderr)
+            return False
     except Exception as e:
         print(f"Extraction error: {str(e)}", file=sys.stderr)
         return False
@@ -615,13 +728,14 @@ def generate_captions(config):
         # 2. Windows: Try CUDA float16 GPU mode ONLY if CUDA runtime DLLs are usable, fallback to CPU int8, and ultimate fallback to default float32.
         model = None
         device_used = "cpu"
+        cpu_threads = max(1, min(4, (os.cpu_count() or 4)))
         try:
             if sys.platform == "darwin":
                 try:
-                    model = WhisperModel(model_name, device="cpu", compute_type="int8", download_root=models_dir)
+                    model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=cpu_threads, download_root=models_dir)
                     device_used = "cpu (int8)"
                 except Exception:
-                    model = WhisperModel(model_name, device="cpu", compute_type="default", download_root=models_dir)
+                    model = WhisperModel(model_name, device="cpu", compute_type="default", cpu_threads=cpu_threads, download_root=models_dir)
                     device_used = "cpu (default)"
             else:
                 cuda_available = is_cuda_usable()
@@ -637,12 +751,12 @@ def generate_captions(config):
                 if not cuda_available:
                     try:
                         # Fallback to high-performance CPU int8 mode
-                        model = WhisperModel(model_name, device="cpu", compute_type="int8", download_root=models_dir)
+                        model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=cpu_threads, download_root=models_dir)
                         device_used = "cpu (int8)"
                     except Exception as cpu_err:
                         # Ultimate safety fallback to CPU default
                         print(f"[Device Notice] CPU int8 failed ({cpu_err}), falling back to CPU default mode", file=sys.stderr, flush=True)
-                        model = WhisperModel(model_name, device="cpu", compute_type="default", download_root=models_dir)
+                        model = WhisperModel(model_name, device="cpu", compute_type="default", cpu_threads=cpu_threads, download_root=models_dir)
                         device_used = "cpu (default)"
         except Exception as model_err:
             err_str = str(model_err).lower()
@@ -670,24 +784,25 @@ def generate_captions(config):
         #     transcribe_args["patience"] = 1.0
         #     transcribe_args["length_penalty"] = 1.0
             
-        # Prevent infinite loops but limit high temp to avoid random language hallucinations
-        transcribe_args["temperature"] = [0.0, 0.2, 0.4]
+        # Strict greedy decoding prevents sampling hallucinations and phoneme scrambling
+        transcribe_args["temperature"] = 0.0
         
-        # Use default no_speech_threshold (0.6) so Whisper can drop silence/noise that causes hallucinations
+        # Drop silence/noise that causes hallucinations
         transcribe_args["no_speech_threshold"] = 0.6 
         
-        # VAD filter: use default threshold 0.5 to prevent noise from entering Whisper
+        # VAD filter: speech detection
         transcribe_args["vad_filter"] = True
         transcribe_args["vad_parameters"] = dict(min_silence_duration_ms=300, speech_pad_ms=400, threshold=0.35)
         
-        # Apply repetition penalty to prevent "jaadi jaadi jaadi" loops
-        transcribe_args["repetition_penalty"] = 1.15 
+        # Repetition penalty and 3-gram blocking prevent repetition loops
+        transcribe_args["repetition_penalty"] = 1.15
+        transcribe_args["no_repeat_ngram_size"] = 3
         
-        # Reset compression ratio to 2.4 (default)
+        # Reset compression ratio to 2.4
         transcribe_args["compression_ratio_threshold"] = 2.4
         
-        # Re-enable hallucination drop logic to prevent infinite repeating loops during pauses
-        transcribe_args["hallucination_silence_threshold"] = 2.0
+        # Hallucination silence threshold suppresses hallucinated speech during silence/music pauses
+        transcribe_args["hallucination_silence_threshold"] = 1.5
         
         def _execute_transcription(active_model):
             seg_gen, inf = active_model.transcribe(temp_wav, **transcribe_args)
@@ -709,10 +824,10 @@ def generate_captions(config):
                 print(f"[Device Notice] CUDA transcription failed ({transcribe_err}), seamlessly switching to CPU fallback...", file=sys.stderr, flush=True)
                 print("[STATUS: Switching to CPU...]", flush=True)
                 try:
-                    model = WhisperModel(model_name, device="cpu", compute_type="int8", download_root=models_dir)
+                    model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=cpu_threads, download_root=models_dir)
                     device_used = "cpu (int8)"
                 except Exception:
-                    model = WhisperModel(model_name, device="cpu", compute_type="default", download_root=models_dir)
+                    model = WhisperModel(model_name, device="cpu", compute_type="default", cpu_threads=cpu_threads, download_root=models_dir)
                     device_used = "cpu (default)"
                 print(f"[Device Notice] Active compute device: {device_used}", file=sys.stderr, flush=True)
                 segments, info = _execute_transcription(model)
@@ -783,6 +898,15 @@ def generate_captions(config):
                 json.dump({"segments": serializable_segments, "language": info.language}, df, ensure_ascii=False, indent=2)
         except Exception as e:
             print("Debug dump failed:", e)
+        # Pre-clamp words and segment boundaries so Whisper attention smearing doesn't contaminate AI Grammar Corrector
+        for seg in segments:
+            if getattr(seg, 'words', None) and len(seg.words) > 0:
+                for w in seg.words:
+                    clean_len = len(str(getattr(w, 'word', '')).strip())
+                    max_w_dur = 0.9 if clean_len <= 4 else 1.25
+                    if (w.end - w.start) > max_w_dur:
+                        w.end = max(round(w.start + max_w_dur, 2), w.start + 0.1)
+                seg.end = seg.words[-1].end
 
         # AI Grammar Corrector
         ai_grammar_model = config.get("aiGrammarModel", "Off")
@@ -940,34 +1064,85 @@ def generate_captions(config):
                                             
                                             for i in range(len(new_words_list)):
                                                 if mapped_starts[i] is None:
-                                                    prev_time = seg_start
+                                                    prev_time = None
                                                     prev_idx = -1
-                                                    for j in range(i-1, -1, -1):
+                                                    for j in range(i - 1, -1, -1):
                                                         if mapped_ends[j] is not None:
                                                             prev_time = mapped_ends[j]
                                                             prev_idx = j
                                                             break
-                                                    
-                                                    next_time = seg_end
+
+                                                    next_time = None
                                                     next_idx = len(new_words_list)
-                                                    for j in range(i+1, len(new_words_list)):
+                                                    for j in range(i + 1, len(new_words_list)):
                                                         if mapped_starts[j] is not None:
                                                             next_time = mapped_starts[j]
                                                             next_idx = j
                                                             break
-                                                            
+
                                                     gap_size = next_idx - prev_idx - 1
-                                                    gap_duration = max(0, next_time - prev_time)
-                                                    word_dur = gap_duration / gap_size if gap_size > 0 else 0
-                                                    
                                                     idx_in_gap = i - prev_idx - 1
-                                                    mapped_starts[i] = prev_time + (idx_in_gap * word_dur)
-                                                    mapped_ends[i] = prev_time + ((idx_in_gap + 1) * word_dur)
-                                                    
+
+                                                    if prev_idx == -1 and next_idx == len(new_words_list):
+                                                        # No words matched at all in entire segment
+                                                        total_dur = max(0.3, seg_end - seg_start)
+                                                        w_dur = max(0.20, min(0.65, total_dur / len(new_words_list)))
+                                                        mapped_starts[i] = seg_start + (i * w_dur)
+                                                        mapped_ends[i] = seg_start + ((i + 1) * w_dur)
+                                                    elif prev_idx == -1:
+                                                        # Prefix words (before first matched word)
+                                                        lead_space = max(0.0, next_time - seg_start)
+                                                        if lead_space >= gap_size * 0.20:
+                                                            w_dur = min(0.50, lead_space / gap_size)
+                                                            mapped_starts[i] = next_time - (gap_size - idx_in_gap) * w_dur
+                                                            mapped_ends[i] = next_time - (gap_size - idx_in_gap - 1) * w_dur
+                                                        else:
+                                                            w_dur = 0.28
+                                                            mapped_starts[i] = max(0.0, next_time - (gap_size - idx_in_gap) * w_dur)
+                                                            mapped_ends[i] = max(0.0, next_time - (gap_size - idx_in_gap - 1) * w_dur)
+                                                    elif next_idx == len(new_words_list):
+                                                        # Suffix words (after last matched word)
+                                                        trail_space = max(0.0, seg_end - prev_time)
+                                                        if trail_space >= gap_size * 0.20:
+                                                            w_dur = min(0.50, trail_space / gap_size)
+                                                            mapped_starts[i] = prev_time + (idx_in_gap * w_dur)
+                                                            mapped_ends[i] = prev_time + ((idx_in_gap + 1) * w_dur)
+                                                        else:
+                                                            w_dur = 0.28
+                                                            mapped_starts[i] = prev_time + (idx_in_gap * w_dur)
+                                                            mapped_ends[i] = prev_time + ((idx_in_gap + 1) * w_dur)
+                                                    else:
+                                                        # Internal gap between two matched words
+                                                        gap_dur = next_time - prev_time
+                                                        if gap_dur >= gap_size * 0.18:
+                                                            w_dur = min(0.60, gap_dur / gap_size)
+                                                            mapped_starts[i] = prev_time + (idx_in_gap * w_dur)
+                                                            mapped_ends[i] = prev_time + ((idx_in_gap + 1) * w_dur)
+                                                        else:
+                                                            # Tight space or zero gap: synthesize safe slots
+                                                            w_dur = 0.22
+                                                            mapped_starts[i] = prev_time + (idx_in_gap * w_dur)
+                                                            mapped_ends[i] = prev_time + ((idx_in_gap + 1) * w_dur)
+
+                                            # Monotonicity & duration sanity pass
+                                            for k in range(len(new_words_list)):
+                                                if mapped_ends[k] - mapped_starts[k] < 0.15:
+                                                    mapped_ends[k] = round(mapped_starts[k] + 0.22, 3)
+                                                elif mapped_ends[k] - mapped_starts[k] > 1.25:
+                                                    mapped_ends[k] = round(mapped_starts[k] + 1.25, 3)
+
+                                                if k > 0 and mapped_starts[k] < mapped_ends[k - 1]:
+                                                    mapped_starts[k] = mapped_ends[k - 1]
+                                                    if mapped_ends[k] <= mapped_starts[k]:
+                                                        mapped_ends[k] = round(mapped_starts[k] + 0.20, 3)
+
                                             for j, w in enumerate(new_words_list):
                                                 new_words_obj.append(DummyWord(w, mapped_starts[j], mapped_ends[j]))
                                                 
                                             cs.words = new_words_obj
+                                            if len(new_words_obj) > 0:
+                                                cs.start = new_words_obj[0].start
+                                                cs.end = new_words_obj[-1].end
                                         else:
                                             cs.words = []
                                             
@@ -1025,8 +1200,56 @@ def generate_captions(config):
             w['start'] = max(0.0, w['start'] - pad)
             w['end'] = max(0.0, w['end'] - pad)
             
-        # Clean foreign script from individual words for Hindi
-        if detected_lang == "hi":
+        # Deduplicate consecutive identical words caused by stutters or hallucinations (3+ repetitions or overlapping phantom tokens)
+        import re
+        deduped_words = []
+        last_clean_word = None
+        consecutive_repeat_count = 0
+        for w in raw_words:
+            clean = re.sub(r'[^\w\s]', '', w['word']).strip().lower()
+            if clean and clean == last_clean_word:
+                consecutive_repeat_count += 1
+                if consecutive_repeat_count > 2:
+                    continue
+                if len(deduped_words) > 0 and (w['start'] < deduped_words[-1]['end'] - 0.05 or (w['end'] - w['start'] < 0.15)):
+                    continue
+            else:
+                last_clean_word = clean
+                consecutive_repeat_count = 1
+            deduped_words.append(w)
+        raw_words = deduped_words
+
+        # Clamp individual word durations to realistic spoken limits (prevents Whisper cross-attention smearing / stretched layers)
+        for w in raw_words:
+            orig_dur = w['end'] - w['start']
+            clean_len = len(str(w.get('word', '')).strip())
+            max_w_dur = 0.9 if clean_len <= 4 else 1.25
+            if orig_dur > max_w_dur:
+                w['end'] = max(round(w['start'] + max_w_dur, 2), w['start'] + 0.1)
+            elif orig_dur < 0.15:
+                w['end'] = round(w['start'] + 0.20, 2)
+
+        # Monotonicity check on raw_words to guarantee strictly non-overlapping sequence
+        for idx in range(1, len(raw_words)):
+            if raw_words[idx]['start'] < raw_words[idx - 1]['end'] - 0.02:
+                raw_words[idx]['start'] = raw_words[idx - 1]['end']
+                if raw_words[idx]['end'] <= raw_words[idx]['start']:
+                    raw_words[idx]['end'] = round(raw_words[idx]['start'] + 0.18, 2)
+
+        # Drop isolated phantom micro-tokens (< 0.22s duration surrounded by >= 0.7s silence, only when other words exist)
+        if len(raw_words) > 1:
+            filtered_words = []
+            for i, w in enumerate(raw_words):
+                w_dur = w['end'] - w['start']
+                prev_gap = (w['start'] - raw_words[i-1]['end']) if i > 0 else 999.0
+                next_gap = (raw_words[i+1]['start'] - w['end']) if i < len(raw_words)-1 else 999.0
+                if w_dur < 0.22 and prev_gap >= 0.7 and next_gap >= 0.7:
+                    continue
+                filtered_words.append(w)
+            raw_words = filtered_words
+            
+        # Clean foreign script from individual words for Hindi and Marathi
+        if detected_lang in ["hi", "mr"]:
             import re, unicodedata
             foreign_pattern = re.compile(r'[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF\u0370-\u03FF\u0590-\u05FF\u0530-\u058F\u0100-\u024F]')
             devanagari_pattern = re.compile(r'[\u0900-\u097F\u1CD0-\u1CFF\uA8E0-\uA8FF]')
@@ -1266,16 +1489,39 @@ def generate_captions(config):
         join_char = "" if is_cjk else " "
         target_chars = words_per_caption * 4 if is_cjk else 0
         
+        def emit_caption(chunk):
+            if not chunk:
+                return
+            text = join_char.join([cw['word'].strip() for cw in chunk])
+            cap_start = chunk[0]['start']
+            cap_end = chunk[-1]['end']
+            
+            # Bound caption duration: never exceed readable natural limit (max 3.2s total, or ~0.85s/word)
+            max_cap_duration = min(3.2, max(1.2, len(chunk) * 0.85))
+            cap_end = min(cap_end, round(cap_start + max_cap_duration, 2))
+            
+            # Ensure minimum legible duration on screen
+            if cap_end - cap_start < 0.35:
+                cap_end = round(cap_start + 0.35, 2)
+                
+            # Ensure each word inside the chunk stays safely within [cap_start, cap_end]
+            for cw in chunk:
+                if cw['end'] > cap_end:
+                    cw['end'] = cap_end
+                if cw['start'] >= cw['end']:
+                    cw['start'] = max(cap_start, round(cw['end'] - 0.1, 2))
+                
+            captions.append({
+                "start": cap_start,
+                "end": cap_end,
+                "text": text,
+                "words": chunk
+            })
+        
         for w in raw_words:
             if current_chunk:
                 if w['start'] - current_chunk[-1]['end'] > max_gap_seconds:
-                    text = join_char.join([cw['word'].strip() for cw in current_chunk])
-                    captions.append({
-                        "start": current_chunk[0]['start'],
-                        "end": current_chunk[-1]['end'],
-                        "text": text,
-                        "words": current_chunk
-                    })
+                    emit_caption(current_chunk)
                     current_chunk = []
                     
             current_chunk.append(w)
@@ -1290,30 +1536,20 @@ def generate_captions(config):
                     should_emit = True
                     
             if should_emit:
-                text = join_char.join([cw['word'].strip() for cw in current_chunk])
-                captions.append({
-                    "start": current_chunk[0]['start'],
-                    "end": current_chunk[-1]['end'],
-                    "text": text,
-                    "words": current_chunk
-                })
+                emit_caption(current_chunk)
                 current_chunk = []
                 
         if current_chunk:
-            text = join_char.join([cw['word'].strip() for cw in current_chunk])
-            captions.append({
-                "start": current_chunk[0]['start'],
-                "end": current_chunk[-1]['end'],
-                "text": text,
-                "words": current_chunk
-            })
+            emit_caption(current_chunk)
             
-        # Actually fill the timeline gaps visually by stretching caption end times
+        # Actually fill the timeline gaps visually by extending caption end times (only across short conversational gaps)
         if fill_silence_gaps and len(captions) > 1:
             for i in range(len(captions) - 1):
-                # Ensure we don't stretch backwards in weird overlapping edge cases
-                if captions[i]['end'] < captions[i+1]['start']:
+                gap = captions[i+1]['start'] - captions[i]['end']
+                if 0 < gap <= max_gap_seconds:
                     captions[i]['end'] = captions[i+1]['start']
+                    if captions[i].get('words') and len(captions[i]['words']) > 0:
+                        captions[i]['words'][-1]['end'] = captions[i]['end']
             
         return {"success": True, "captions": captions}
     except Exception as e:
