@@ -131,8 +131,13 @@ def get_system_machine_guid():
             match = re.search(r'MachineGuid\s+REG_SZ\s+([a-zA-Z0-9-]+)', reg_out.decode(), re.IGNORECASE)
             return "".join(c for c in match.group(1) if c.isalnum()) if match else ""
         else:
-            out = subprocess.check_output("ioreg -rd1 -c IOPlatformExpertDevice | awk '/IOPlatformUUID/ { split($0, line, \"\\\"\"); printf(\"%s\\n\", line[4]); }'", shell=True, stderr=subprocess.DEVNULL)
-            return "".join(c for c in out.decode().strip() if c.isalnum())
+            try:
+                out = subprocess.check_output(['/usr/sbin/ioreg', '-rd1', '-c', 'IOPlatformExpertDevice'], stderr=subprocess.DEVNULL)
+            except Exception:
+                out = subprocess.check_output(['ioreg', '-rd1', '-c', 'IOPlatformExpertDevice'], stderr=subprocess.DEVNULL)
+            import re
+            match = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', out.decode(), re.IGNORECASE)
+            return "".join(c for c in match.group(1) if c.isalnum()) if match else ""
     except Exception:
         return ""
 
@@ -193,8 +198,13 @@ def get_hardware_id():
                     hwid = 'WIN_' + os.environ.get('COMPUTERNAME', 'DEVICE')
             return hwid
         else:
-            out = subprocess.check_output("ioreg -rd1 -c IOPlatformExpertDevice | awk '/IOPlatformUUID/ { split($0, line, \"\\\"\"); printf(\"%s\\n\", line[4]); }'", shell=True, stderr=subprocess.DEVNULL)
-            hwid = "".join(c for c in out.decode().strip() if c.isalnum())
+            try:
+                out = subprocess.check_output(['/usr/sbin/ioreg', '-rd1', '-c', 'IOPlatformExpertDevice'], stderr=subprocess.DEVNULL)
+            except Exception:
+                out = subprocess.check_output(['ioreg', '-rd1', '-c', 'IOPlatformExpertDevice'], stderr=subprocess.DEVNULL)
+            import re
+            match = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', out.decode(), re.IGNORECASE)
+            hwid = "".join(c for c in match.group(1) if c.isalnum()) if match else ""
             if not hwid or len(hwid) < 4:
                 unsealed = unseal_device_identity()
                 if unsealed and len(unsealed) >= 4:
@@ -573,10 +583,10 @@ except ImportError:
     print(json.dumps({"error": "AI components not found. Please verify QuickSub Pro installation."}))
     sys.exit(1)
 
-def extract_audio(input_file, start_time, duration, output_wav):
-    import sys
+def get_ffmpeg_path():
+    """Resolves the verified platform-specific FFmpeg executable."""
+    import sys, platform
     if sys.platform == "darwin":
-        import platform
         is_arm = platform.machine().lower() in ["arm64", "aarch64"]
         arm_ffmpeg = os.path.join(SCRIPT_DIR, "mac", "ffmpeg_arm64")
         if is_arm and os.path.exists(arm_ffmpeg):
@@ -595,36 +605,65 @@ def extract_audio(input_file, start_time, duration, output_wav):
                 os.chmod(ffmpeg_exe, 0o755)
             except Exception:
                 pass
+        return ffmpeg_exe
     else:
-        ffmpeg_exe = os.path.join(SCRIPT_DIR, "win", "ffmpeg.exe")
-    cmd = [
+        return os.path.join(SCRIPT_DIR, "win", "ffmpeg.exe")
+
+def extract_audio(input_file, start_time, duration, output_wav):
+    """
+    Extracts 16kHz mono audio from input with dynamic loudness normalization,
+    noise filtering, and vocal frequency isolation for optimal Whisper accuracy.
+    """
+    ffmpeg_exe = get_ffmpeg_path()
+    
+    # Audio Enhancement Filter Pipeline:
+    # 1. Bandpass filter: highpass 80Hz (cuts low rumble/sub-bass) + lowpass 7500Hz (cuts high sizzle)
+    # 2. FFT noise reduction (afftdn): -20dB noise floor reduction for clean speech SNR
+    # 3. Dynamic Audio Normalizer (dynaudnorm): Smooth dynamic loudness leveling (boosts quiet speech up to 10x, compresses loud SFX)
+    enhanced_filter = "highpass=f=80,lowpass=f=7500,afftdn=nf=-20,dynaudnorm=f=150:g=15:p=0.95:m=10.0:r=0.9"
+    
+    cmd_primary = [
         ffmpeg_exe, "-y",
         "-i", input_file,
         "-ss", str(start_time),
         "-t", str(duration),
         "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-        "-af", "highpass=f=60,lowpass=f=7500",
+        "-af", enhanced_filter,
         output_wav
     ]
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        subprocess.run(cmd_primary, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         return True
     except subprocess.CalledProcessError:
-        # Automatic safety fallback without audio filter in case ffmpeg version or format rejects filter
-        cmd_fallback = [
+        # Tier 2 fallback: Basic vocal bandpass filter
+        cmd_fallback_bandpass = [
             ffmpeg_exe, "-y",
             "-i", input_file,
             "-ss", str(start_time),
             "-t", str(duration),
             "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            "-af", "highpass=f=60,lowpass=f=7500",
             output_wav
         ]
         try:
-            subprocess.run(cmd_fallback, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            subprocess.run(cmd_fallback_bandpass, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             return True
-        except Exception as e:
-            print(f"FFmpeg extraction fallback failed: {str(e)}", file=sys.stderr)
-            return False
+        except Exception:
+            # Tier 3 fallback: Raw PCM extraction without filters
+            cmd_fallback_raw = [
+                ffmpeg_exe, "-y",
+                "-i", input_file,
+                "-ss", str(start_time),
+                "-t", str(duration),
+                "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                output_wav
+            ]
+            try:
+                subprocess.run(cmd_fallback_raw, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                return True
+            except Exception as e:
+                print(f"FFmpeg extraction fallback failed: {str(e)}", file=sys.stderr)
+                return False
     except Exception as e:
         print(f"Extraction error: {str(e)}", file=sys.stderr)
         return False
@@ -785,7 +824,7 @@ def generate_captions(config):
         print("[STATUS: Transcribing...]", flush=True)
         print("[PROGRESS: 40]", flush=True)
         
-        transcribe_args = {"word_timestamps": True, "task": task, "condition_on_previous_text": False}
+        transcribe_args = {"word_timestamps": True, "task": task, "condition_on_previous_text": True}
         if language != "auto":
             transcribe_args["language"] = language
         if prompt:
@@ -803,34 +842,148 @@ def generate_captions(config):
         # Strict greedy decoding prevents sampling hallucinations and phoneme scrambling
         transcribe_args["temperature"] = 0.0
         
-        # Drop silence/noise that causes hallucinations
-        transcribe_args["no_speech_threshold"] = 0.6 
+        # Balanced no-speech threshold to suppress silence/room-noise hallucinations while capturing quiet voiceovers
+        transcribe_args["no_speech_threshold"] = 0.65 
         
-        # VAD filter: speech detection
+        # VAD speech detection filter (used when duration <= 26s)
         transcribe_args["vad_filter"] = True
-        transcribe_args["vad_parameters"] = dict(min_silence_duration_ms=300, speech_pad_ms=400, threshold=0.35)
-        
-        # Repetition penalty and 3-gram blocking prevent repetition loops
-        transcribe_args["repetition_penalty"] = 1.15
-        transcribe_args["no_repeat_ngram_size"] = 3
+        transcribe_args["vad_parameters"] = dict(min_silence_duration_ms=400, speech_pad_ms=400, threshold=0.20)
         
         # Reset compression ratio to 2.4
         transcribe_args["compression_ratio_threshold"] = 2.4
         
         # Hallucination silence threshold suppresses hallucinated speech during silence/music pauses
-        transcribe_args["hallucination_silence_threshold"] = 1.5
+        transcribe_args["hallucination_silence_threshold"] = 2.5
         
+        def find_optimal_split_points(wav_path, max_chunk_dur=26.0, min_chunk_dur=18.0):
+            """
+            Finds quiet moments / breath pauses between min_chunk_dur and max_chunk_dur
+            to divide long audio into Whisper-native sweet-spot chunks (<= 26s),
+            preventing Whisper's 30-second window skipping bug.
+            """
+            import wave
+            import numpy as np
+            try:
+                with wave.open(wav_path, 'rb') as wf:
+                    sample_rate = wf.getframerate()
+                    n_frames = wf.getnframes()
+                    data = wf.readframes(n_frames)
+                
+                total_sec = n_frames / sample_rate
+                if total_sec <= max_chunk_dur:
+                    return [(0.0, total_sec)]
+                
+                samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                win_size = int(sample_rate * 0.05)
+                n_windows = len(samples) // win_size
+                if n_windows == 0:
+                    return [(0.0, total_sec)]
+                
+                rms = np.sqrt(np.mean(samples[:n_windows * win_size].reshape(-1, win_size)**2, axis=1))
+                
+                splits = [0.0]
+                curr_pos = 0.0
+                
+                while (curr_pos + max_chunk_dur) < total_sec:
+                    search_start_s = curr_pos + min_chunk_dur
+                    search_end_s = min(curr_pos + max_chunk_dur, total_sec)
+                    
+                    start_w = int((search_start_s * sample_rate) / win_size)
+                    end_w = int((search_end_s * sample_rate) / win_size)
+                    
+                    if start_w >= end_w or start_w >= len(rms):
+                        best_split_s = round(curr_pos + max_chunk_dur, 2)
+                    else:
+                        min_idx = start_w + int(np.argmin(rms[start_w:end_w]))
+                        best_split_s = round((min_idx * win_size) / sample_rate, 2)
+                        
+                    splits.append(best_split_s)
+                    curr_pos = best_split_s
+                    
+                splits.append(total_sec)
+                
+                chunks = []
+                for i in range(len(splits) - 1):
+                    c_dur = round(splits[i+1] - splits[i], 3)
+                    if c_dur > 0.05:
+                        chunks.append((splits[i], c_dur))
+                return chunks
+            except Exception:
+                return [(0.0, duration)]
+
         def _execute_transcription(active_model):
-            seg_gen, inf = active_model.transcribe(temp_wav, **transcribe_args)
+            chunks = find_optimal_split_points(temp_wav, max_chunk_dur=26.0, min_chunk_dur=18.0)
+            
+            # If audio is short (<= 26s), transcribe directly
+            if len(chunks) <= 1:
+                seg_gen, inf = active_model.transcribe(temp_wav, **transcribe_args)
+                collected_segments = []
+                for segment in seg_gen:
+                    collected_segments.append(segment)
+                    if duration > 0:
+                        progress_fraction = min(1.0, segment.end / duration)
+                        current_pct = 40 + int(progress_fraction * 40)
+                        print(f"[PROGRESS: {current_pct}]", flush=True)
+                return collected_segments, inf
+
+            # Multi-chunk execution for long audio (> 26s) to eliminate the 30s window skipping bug
+            class ChunkWord:
+                def __init__(self, start, end, word, probability=1.0):
+                    self.start = start
+                    self.end = end
+                    self.word = word
+                    self.probability = probability
+
+            class ChunkSegment:
+                def __init__(self, start, end, text, words=None):
+                    self.start = start
+                    self.end = end
+                    self.text = text
+                    self.words = words or []
+
             collected_segments = []
-            for segment in seg_gen:
-                collected_segments.append(segment)
-                # Safely calculate progress between 40% and 80%
-                if duration > 0:
-                    progress_fraction = min(1.0, segment.end / duration)
-                    current_pct = 40 + int(progress_fraction * 40)
+            last_inf = None
+            total_chunks = len(chunks)
+            ffmpeg_bin = get_ffmpeg_path()
+            
+            chunk_args = dict(transcribe_args)
+            # On individual chunks <= 26s, disable VAD filter so speech mixed with game BGM/SFX is never dropped
+            chunk_args["vad_filter"] = False
+
+            for c_idx, (c_start, c_dur) in enumerate(chunks):
+                chunk_wav = os.path.join(tempfile.gettempdir(), f"quicksub_chunk_{c_idx}.wav")
+                try:
+                    subprocess.run([
+                        ffmpeg_bin, "-y",
+                        "-i", temp_wav,
+                        "-ss", str(c_start), "-t", str(c_dur),
+                        "-acodec", "copy",
+                        chunk_wav
+                    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    seg_gen, inf = active_model.transcribe(chunk_wav, **chunk_args)
+                    last_inf = inf
+                    
+                    for segment in seg_gen:
+                        s_start = round(c_start + segment.start, 2)
+                        s_end = round(c_start + segment.end, 2)
+                        shifted_words = []
+                        if getattr(segment, 'words', None):
+                            for w in segment.words:
+                                w_start = round(c_start + w.start, 2)
+                                w_end = round(c_start + w.end, 2)
+                                shifted_words.append(ChunkWord(w_start, w_end, w.word, getattr(w, 'probability', 1.0)))
+                        collected_segments.append(ChunkSegment(s_start, s_end, segment.text, shifted_words))
+
+                    current_pct = 40 + int(((c_idx + 1) / total_chunks) * 40)
                     print(f"[PROGRESS: {current_pct}]", flush=True)
-            return collected_segments, inf
+                finally:
+                    if os.path.exists(chunk_wav):
+                        try:
+                            os.remove(chunk_wav)
+                        except Exception:
+                            pass
+            
+            return collected_segments, last_inf
 
         try:
             segments, info = _execute_transcription(model)
@@ -1235,6 +1388,58 @@ def generate_captions(config):
                 consecutive_repeat_count = 1
             deduped_words.append(w)
         raw_words = deduped_words
+
+        # Multi-word phrase & n-gram hallucination loop detector
+        # Cuts autoregressive feedback loops when Whisper repeats phrases during silence or outro
+        # (e.g. 'मान शेवटी ना' or 'त्यामोले में अच्छोप्रा नाही है' repeating multiple times)
+        def _clean_token(w):
+            return re.sub(r'[^\w\s]', '', str(w.get('word', ''))).strip().lower()
+
+        clean_tokens = [_clean_token(w) for w in raw_words]
+        keep_mask = [True] * len(raw_words)
+        idx_loop = 0
+        while idx_loop < len(raw_words):
+            if not keep_mask[idx_loop]:
+                idx_loop += 1
+                continue
+            loop_found = False
+            for n in range(8, 0, -1):
+                if idx_loop + n > len(raw_words):
+                    continue
+                pattern = clean_tokens[idx_loop:idx_loop+n]
+                if not any(pattern):
+                    continue
+                repeat_count = 1
+                curr_pos = idx_loop + n
+                while curr_pos + n <= len(raw_words):
+                    next_chunk = clean_tokens[curr_pos:curr_pos+n]
+                    if next_chunk == pattern:
+                        repeat_count += 1
+                        curr_pos += n
+                    else:
+                        break
+                # In natural speech, 1 or 2 words can repeat up to 3 times (e.g. 'chalo chalo chalo', 'ruk jao ruk jao ruk jao').
+                # 3+ words can repeat up to 2 times. Anything beyond that is a Whisper hallucination loop.
+                max_allowed = 3 if n <= 2 else 2
+                if repeat_count > max_allowed:
+                    drop_start = idx_loop + (n * max_allowed)
+                    drop_end = curr_pos
+                    for d in range(drop_start, len(raw_words)):
+                        if d < drop_end:
+                            keep_mask[d] = False
+                        elif d >= drop_end:
+                            if clean_tokens[d] in pattern:
+                                keep_mask[d] = False
+                    idx_loop = curr_pos
+                    loop_found = True
+                    break
+            if not loop_found:
+                idx_loop += 1
+        raw_words = [w for k_idx, w in enumerate(raw_words) if keep_mask[k_idx]]
+
+        # Truncate any words whose start time exceeds the audio duration
+        if duration > 0:
+            raw_words = [w for w in raw_words if w['start'] < duration]
 
         # Clamp individual word durations to realistic spoken limits (prevents Whisper cross-attention smearing / stretched layers)
         for w in raw_words:
