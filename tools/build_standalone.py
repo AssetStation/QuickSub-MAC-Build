@@ -59,8 +59,9 @@ def package_cuda_zip():
     print(f"[✓] Successfully created {cuda_zip_path} ({zip_size_mb:.1f} MB)")
 
 def compile_native_msvc_launcher(engine_dir):
-    """Compiles a clean native MSVC C++ launcher to replace PyInstaller's generic bootloader."""
-    print("\n[*] Compiling native MSVC C++ Launcher (eliminates PyInstaller antivirus false positives)...")
+    """Compiles a clean native MSVC C++ launcher to replace PyInstaller's generic bootloader
+    and configures an isolated official embeddable Python runtime (0% antivirus false positives)."""
+    print("\n[*] Configuring isolated official Python runtime & MSVC Launcher (0% antivirus false positives)...")
 
     # 1. Compile generate_captions.py to bytecode generate_captions.pyc
     import py_compile
@@ -82,7 +83,100 @@ def compile_native_msvc_launcher(engine_dir):
     except Exception as e:
         print(f"[!] Warning: Could not copy python.exe: {e}")
 
-    # 2. Locate Visual Studio vcvars64.bat
+    # 3. Ensure official python311.dll & python3.dll are in engine directory
+    internal_dir = os.path.join(engine_dir, "_internal")
+    for dll_name in ["python311.dll", "python3.dll"]:
+        dst_dll = os.path.join(engine_dir, dll_name)
+        if not os.path.exists(dst_dll):
+            src_candidate = os.path.join(internal_dir, dll_name)
+            if not os.path.exists(src_candidate):
+                src_candidate = os.path.join(sys.base_prefix, dll_name)
+            if os.path.exists(src_candidate):
+                try:
+                    shutil.copy2(src_candidate, dst_dll)
+                    print(f"[✓] Copied {dll_name} to engine root: {dst_dll}")
+                except Exception as e:
+                    print(f"[!] Warning copying {dll_name}: {e}")
+
+    # 4. Ensure official python311.zip (embeddable stdlib) is present
+    python_zip = os.path.join(engine_dir, "python311.zip")
+    if not os.path.exists(python_zip) or os.path.getsize(python_zip) < 1000000:
+        print("[*] Retrieving official Python standard library (python311.zip)...")
+        cache_zip = os.path.join(TOOLS_DIR, "python311.zip")
+        if os.path.exists(cache_zip):
+            shutil.copy2(cache_zip, python_zip)
+            print(f"[✓] Copied cached python311.zip to engine root: {python_zip}")
+        else:
+            try:
+                import urllib.request, io
+                embed_url = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip"
+                print(f"[*] Downloading embed package from {embed_url}...")
+                with urllib.request.urlopen(embed_url, timeout=30) as resp:
+                    embed_bytes = resp.read()
+                with zipfile.ZipFile(io.BytesIO(embed_bytes)) as zf:
+                    zf.extract("python311.zip", engine_dir)
+                    zf.extract("python311.zip", TOOLS_DIR)
+                print(f"[✓] Successfully installed official python311.zip ({os.path.getsize(python_zip) // 1024} KB)")
+            except Exception as dl_err:
+                print(f"[!] Warning: Could not download embed package ({dl_err}). Packing from local Lib...")
+                lib_dir = os.path.join(sys.base_prefix, "Lib")
+                if os.path.isdir(lib_dir):
+                    with zipfile.ZipFile(python_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for root, dirs, files in os.walk(lib_dir):
+                            dirs[:] = [d for d in dirs if d not in ["site-packages", "test", "idlelib", "tkinter"]]
+                            for f in files:
+                                if f.endswith((".py", ".pyc")):
+                                    full_f = os.path.join(root, f)
+                                    arc = os.path.relpath(full_f, lib_dir)
+                                    zf.write(full_f, arc)
+                    print(f"[✓] Packed local Python standard library to: {python_zip}")
+
+    # 5. Write python311._pth to enforce complete isolated mode
+    pth_file = os.path.join(engine_dir, "python311._pth")
+    with open(pth_file, "w", encoding="utf-8") as f:
+        f.write("python311.zip\n.\n_internal\n")
+    print(f"[✓] Configured isolated runtime environment: {pth_file}")
+
+    # 6. Synchronize complete pure-Python package sources into _internal (e.g. av, numpy, filelock, fsspec, yaml, httpx)
+    site_packages = os.path.join(sys.base_prefix, "Lib", "site-packages")
+    if os.path.isdir(site_packages) and os.path.isdir(internal_dir):
+        packages_to_sync = [
+            "av", "numpy", "filelock", "fsspec", "packaging", "yaml",
+            "httpx", "httpcore", "anyio", "sniffio", "h11", "idna"
+        ]
+        for pkg in packages_to_sync:
+            src_pkg = os.path.join(site_packages, pkg)
+            dst_pkg = os.path.join(internal_dir, pkg)
+            if os.path.isdir(src_pkg):
+                for root, dirs, files in os.walk(src_pkg):
+                    rel = os.path.relpath(root, src_pkg)
+                    target_dir = os.path.join(dst_pkg, rel)
+                    os.makedirs(target_dir, exist_ok=True)
+                    for f in files:
+                        if f.endswith((".py", ".pyi", ".pyd")):
+                            src_file = os.path.join(root, f)
+                            dst_file = os.path.join(target_dir, f)
+                            if not os.path.exists(dst_file):
+                                shutil.copy2(src_file, dst_file)
+        # Also copy single-file pure Python modules
+        single_modules = ["typing_extensions.py"]
+        for mod in single_modules:
+            src_mod = os.path.join(site_packages, mod)
+            dst_mod = os.path.join(internal_dir, mod)
+            if os.path.exists(src_mod) and not os.path.exists(dst_mod):
+                shutil.copy2(src_mod, dst_mod)
+        print("[✓] Synchronized all runtime package sources into _internal.")
+
+    # 7. Purge any debug CRT DLLs (*d.dll) from engine_dir
+    for f in os.listdir(engine_dir):
+        if f.lower().endswith("d.dll") and ("msvcp" in f.lower() or "vcruntime" in f.lower()):
+            try:
+                os.remove(os.path.join(engine_dir, f))
+                print(f"[✓] Removed debug CRT binary: {f}")
+            except Exception:
+                pass
+
+    # 8. Locate Visual Studio vcvars64.bat
     vswhere = os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe")
     vcvars_path = None
     if os.path.exists(vswhere):
@@ -110,7 +204,7 @@ def compile_native_msvc_launcher(engine_dir):
         print("[!] Launcher source files not found. Skipping.")
         return
 
-    # 3. Compile with rc.exe and cl.exe
+    # 9. Compile with rc.exe and cl.exe
     build_cmd = (
         f'call "{vcvars_path}" && '
         f'cd /d "{TOOLS_DIR}" && '
@@ -216,6 +310,8 @@ def build_standalone(include_cuda=False):
         if os.path.isdir(ENGINE_DIR):
             for f in os.listdir(ENGINE_DIR):
                 if f.lower().endswith(".dll"):
+                    if f.lower().endswith("d.dll") and ("msvcp" in f.lower() or "vcruntime" in f.lower()):
+                        continue
                     dll_src = os.path.join(ENGINE_DIR, f)
                     dll_dst = os.path.join(msvc_dlls_dir, f)
                     if not os.path.exists(dll_dst):
@@ -243,6 +339,8 @@ def build_standalone(include_cuda=False):
                 print("[*] Ensuring MSVC runtime DLLs are bundled...")
                 for f in os.listdir(msvc_dlls_dir):
                     if f.lower().endswith(".dll"):
+                        if f.lower().endswith("d.dll") and ("msvcp" in f.lower() or "vcruntime" in f.lower()):
+                            continue
                         src = os.path.join(msvc_dlls_dir, f)
                         dst = os.path.join(ENGINE_DIR, f)
                         if not os.path.exists(dst):

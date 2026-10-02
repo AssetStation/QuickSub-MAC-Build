@@ -775,9 +775,10 @@ def generate_captions(config):
                         device_used = "cpu (default)"
         except Exception as model_err:
             err_str = str(model_err).lower()
-            cleanup_partial_models(models_dir)
-            if any(k in err_str for k in ["huggingface", "connect", "network", "offline", "resolve", "http", "socket"]):
-                return {"error": "Download failed: Network lost. Connect to internet to download again."}
+            if not isinstance(model_err, (ImportError, ModuleNotFoundError, AttributeError)) and not "no module named" in err_str:
+                if any(k in err_str for k in ["connect", "network lost", "network is unreachable", "connection error", "name or service not known"]):
+                    cleanup_partial_models(models_dir)
+                    return {"error": "Download failed: Network lost. Connect to internet to download again."}
             raise model_err
 
         print(f"[Device Notice] Active compute device: {device_used}", file=sys.stderr, flush=True)
@@ -905,14 +906,15 @@ def generate_captions(config):
                     cs._original = seg
                     segments[seg_idx] = cs
 
-        # DEBUG: Dump raw whisper output
-        try:
-            debug_path = os.path.join(tempfile.gettempdir(), "quicksub_whisper_raw.json")
-            with open(debug_path, "w", encoding="utf-8") as df:
-                serializable_segments = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
-                json.dump({"segments": serializable_segments, "language": info.language}, df, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print("Debug dump failed:", e)
+        # DEBUG: Dump raw whisper output (opt-in only for developer diagnostics)
+        if config.get("debug_dump"):
+            try:
+                debug_path = os.path.join(tempfile.gettempdir(), "quicksub_whisper_raw.json")
+                with open(debug_path, "w", encoding="utf-8") as df:
+                    serializable_segments = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
+                    json.dump({"segments": serializable_segments, "language": info.language}, df, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
         # Pre-clamp words and segment boundaries so Whisper attention smearing doesn't contaminate AI Grammar Corrector
         for seg in segments:
             if getattr(seg, 'words', None) and len(seg.words) > 0:
