@@ -58,6 +58,73 @@ def package_cuda_zip():
     zip_size_mb = os.path.getsize(cuda_zip_path) / (1024 * 1024)
     print(f"[✓] Successfully created {cuda_zip_path} ({zip_size_mb:.1f} MB)")
 
+def compile_native_msvc_launcher(engine_dir):
+    """Compiles a clean native MSVC C++ launcher to replace PyInstaller's generic bootloader."""
+    print("\n[*] Compiling native MSVC C++ Launcher (eliminates PyInstaller antivirus false positives)...")
+
+    # 1. Compile generate_captions.py to bytecode generate_captions.pyc
+    import py_compile
+    src_py = os.path.join(TOOLS_DIR, "generate_captions.py")
+    dst_pyc = os.path.join(engine_dir, "generate_captions.pyc")
+    if os.path.exists(src_py):
+        try:
+            py_compile.compile(src_py, cfile=dst_pyc, doraise=True)
+            print(f"[✓] Compiled bytecode engine: {dst_pyc}")
+        except Exception as e:
+            print(f"[!] Warning: Could not compile pyc: {e}")
+
+    # 2. Copy official signed python.exe to engine directory
+    python_src = sys.executable
+    python_dst = os.path.join(engine_dir, "python.exe")
+    try:
+        shutil.copy2(python_src, python_dst)
+        print(f"[✓] Bundled official signed Python binary: {python_dst}")
+    except Exception as e:
+        print(f"[!] Warning: Could not copy python.exe: {e}")
+
+    # 2. Locate Visual Studio vcvars64.bat
+    vswhere = os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe")
+    vcvars_path = None
+    if os.path.exists(vswhere):
+        try:
+            res = subprocess.run(
+                [vswhere, "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],
+                capture_output=True, text=True, check=True
+            )
+            vs_path = res.stdout.strip()
+            cand = os.path.join(vs_path, "VC", "Auxiliary", "Build", "vcvars64.bat")
+            if os.path.exists(cand):
+                vcvars_path = cand
+        except Exception:
+            pass
+
+    if not vcvars_path:
+        print("[!] Visual Studio C++ compiler not detected. Skipping native launcher compilation.")
+        return
+
+    launcher_cpp = os.path.join(TOOLS_DIR, "launcher.cpp")
+    launcher_rc = os.path.join(TOOLS_DIR, "launcher.rc")
+    out_exe = os.path.join(engine_dir, "generate_captions.exe")
+
+    if not os.path.exists(launcher_cpp) or not os.path.exists(launcher_rc):
+        print("[!] Launcher source files not found. Skipping.")
+        return
+
+    # 3. Compile with rc.exe and cl.exe
+    build_cmd = (
+        f'call "{vcvars_path}" && '
+        f'cd /d "{TOOLS_DIR}" && '
+        f'rc /fo launcher.res launcher.rc && '
+        f'cl /O2 /W3 /MT /EHsc /Fe:"{out_exe}" launcher.cpp launcher.res && '
+        f'del launcher.obj launcher.res'
+    )
+    proc = subprocess.run(build_cmd, shell=True, capture_output=True, text=True)
+    if proc.returncode == 0 and os.path.exists(out_exe):
+        size_kb = os.path.getsize(out_exe) // 1024
+        print(f"[✓] Successfully compiled clean native C++ launcher: {out_exe} ({size_kb} KB)")
+    else:
+        print(f"[!] Warning: Native launcher compilation failed, keeping existing binary:\n{proc.stderr or proc.stdout}")
+
 def build_standalone(include_cuda=False):
     print("=" * 60)
     print("QuickSub Pro - Standalone Engine Compiler")
@@ -106,6 +173,14 @@ def build_standalone(include_cuda=False):
 
     for ex in excludes:
         cmd.extend(["--exclude-module", ex])
+
+    if not IS_MAC:
+        version_file = os.path.join(TOOLS_DIR, "version_info.txt")
+        if os.path.exists(version_file):
+            cmd.extend(["--version-file", version_file])
+        ico_file = os.path.join(TOOLS_DIR, "win", "icon.ico")
+        if os.path.exists(ico_file):
+            cmd.extend(["--icon", ico_file])
 
     cmd.append(SCRIPT_PATH)
 
@@ -172,6 +247,9 @@ def build_standalone(include_cuda=False):
                         dst = os.path.join(ENGINE_DIR, f)
                         if not os.path.exists(dst):
                             shutil.copy2(src, dst)
+
+            # 5. Compile clean native C++ launcher (eliminates PyInstaller antivirus false positives)
+            compile_native_msvc_launcher(ENGINE_DIR)
     finally:
         # Fallback safety: if an error occurred before restoring CUDA, restore it now
         if has_existing_cuda and os.path.isdir(cuda_staging_dir):
@@ -224,10 +302,18 @@ def build_with_nuitka(include_cuda=False):
         "--include-package=onnxruntime",
         "--include-package=cryptography",
         "--include-package=certifi",
-        "--no-prefer-source-code",
     ]
     if not IS_MAC:
-        cmd.append("--windows-console-mode=disable")
+        cmd.append("--windows-console-mode=force")
+        cmd.append("--company-name=QuickSub Pro")
+        cmd.append("--product-name=QuickSub Pro")
+        cmd.append("--file-version=1.0.0.0")
+        cmd.append("--product-version=1.0.0.0")
+        cmd.append("--file-description=QuickSub Pro AI Caption Generation Engine")
+        cmd.append("--copyright=Copyright (C) 2026 QuickSub Pro")
+        ico_file = os.path.join(TOOLS_DIR, "win", "icon.ico")
+        if os.path.exists(ico_file):
+            cmd.append(f"--windows-icon-from-ico={ico_file}")
     cmd.append(SCRIPT_PATH)
 
     print(f"[*] Running Nuitka command:\n{' '.join(cmd)}\n")
@@ -243,10 +329,42 @@ def build_with_nuitka(include_cuda=False):
         print(f"[!] Nuitka output directory not found in {DIST_DIR}")
         sys.exit(1)
 
-    if os.path.exists(ENGINE_DIR):
-        shutil.rmtree(ENGINE_DIR, ignore_errors=True)
-    os.makedirs(os.path.dirname(ENGINE_DIR), exist_ok=True)
-    shutil.move(built_engine_src, ENGINE_DIR)
+    # Preserve existing CUDA runtime folder (~1.9 GB)
+    cuda_src_dir = os.path.join(ENGINE_DIR, "cuda")
+    cuda_staging_dir = os.path.join(TOOLS_DIR, "_cuda_staging_tmp")
+    has_existing_cuda = False
+    if os.path.isdir(cuda_src_dir):
+        print(f"[*] Found existing CUDA runtime at: {cuda_src_dir}")
+        print("[*] Staging CUDA runtime safely to prevent deletion during rebuild...")
+        if os.path.exists(cuda_staging_dir):
+            shutil.rmtree(cuda_staging_dir, ignore_errors=True)
+        shutil.move(cuda_src_dir, cuda_staging_dir)
+        has_existing_cuda = True
+
+    try:
+        if os.path.exists(ENGINE_DIR):
+            shutil.rmtree(ENGINE_DIR, ignore_errors=True)
+        os.makedirs(os.path.dirname(ENGINE_DIR), exist_ok=True)
+        shutil.move(built_engine_src, ENGINE_DIR)
+
+        if has_existing_cuda and os.path.isdir(cuda_staging_dir):
+            print(f"[✓] Restoring CUDA runtime pack to: {cuda_src_dir}")
+            shutil.move(cuda_staging_dir, cuda_src_dir)
+
+        if not IS_MAC:
+            msvc_dlls_dir = os.path.join(TOOLS_DIR, "win", "dlls")
+            if os.path.isdir(msvc_dlls_dir):
+                for f in os.listdir(msvc_dlls_dir):
+                    if f.lower().endswith(".dll"):
+                        src = os.path.join(msvc_dlls_dir, f)
+                        dst = os.path.join(ENGINE_DIR, f)
+                        if not os.path.exists(dst):
+                            shutil.copy2(src, dst)
+    finally:
+        if has_existing_cuda and os.path.isdir(cuda_staging_dir):
+            if not os.path.isdir(cuda_src_dir):
+                os.makedirs(ENGINE_DIR, exist_ok=True)
+                shutil.move(cuda_staging_dir, cuda_src_dir)
 
     for p in [BUILD_DIR, DIST_DIR]:
         if os.path.exists(p):
@@ -259,6 +377,8 @@ def build_with_nuitka(include_cuda=False):
 if __name__ == "__main__":
     if "--package-cuda-zip" in sys.argv:
         package_cuda_zip()
+    elif "--launcher-only" in sys.argv:
+        compile_native_msvc_launcher(ENGINE_DIR)
     elif "--nuitka" in sys.argv:
         inc_cuda = "--include-cuda" in sys.argv
         build_with_nuitka(include_cuda=inc_cuda)

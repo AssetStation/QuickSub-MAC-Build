@@ -17,23 +17,23 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
 # Get the directory where this script/engine lives (the tools folder)
+# Get the directory where this script/engine lives (the tools folder)
 IS_FROZEN = getattr(sys, 'frozen', False)
-if IS_FROZEN:
-    EXE_DIR = os.path.dirname(os.path.abspath(sys.executable))
-    candidate = EXE_DIR
-    FOUND_TOOLS_DIR = None
-    for _ in range(4):
-        if (os.path.exists(os.path.join(candidate, "models")) or 
-            os.path.exists(os.path.join(candidate, "win", "ffmpeg.exe")) or 
-            os.path.exists(os.path.join(candidate, "mac", "ffmpeg")) or
-            os.path.exists(os.path.join(candidate, "mac", "ffmpeg_arm64"))):
-            FOUND_TOOLS_DIR = candidate
-            break
-        candidate = os.path.dirname(candidate)
-    SCRIPT_DIR = FOUND_TOOLS_DIR if FOUND_TOOLS_DIR else os.path.dirname(EXE_DIR)
-else:
-    EXE_DIR = os.path.dirname(os.path.abspath(__file__))
-    SCRIPT_DIR = EXE_DIR
+BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if IS_FROZEN else __file__))
+EXE_DIR = BASE_DIR
+
+candidate = BASE_DIR
+FOUND_TOOLS_DIR = None
+for _ in range(5):
+    if (os.path.exists(os.path.join(candidate, "models")) or 
+        os.path.exists(os.path.join(candidate, "win", "ffmpeg.exe")) or 
+        os.path.exists(os.path.join(candidate, "mac", "ffmpeg")) or
+        os.path.exists(os.path.join(candidate, "mac", "ffmpeg_arm64"))):
+        FOUND_TOOLS_DIR = candidate
+        break
+    candidate = os.path.dirname(candidate)
+
+SCRIPT_DIR = FOUND_TOOLS_DIR if FOUND_TOOLS_DIR else os.path.dirname(BASE_DIR)
 
 # Add the local tools folder to PATH so whisper can find the local ffmpeg.exe
 if sys.platform == "darwin":
