@@ -1085,10 +1085,17 @@ def generate_captions(config):
         gemini_handled_hinglish = False
         
         if ai_grammar_model != "Off" and gemini_api_key:
-            # Fallback cascade
+            # Fallback cascade prioritized by speed & availability
             models_to_try = [ai_grammar_model]
-            if ai_grammar_model not in ["gemini-2.5-flash", "gemini-2.5-flash-lite"]:
-                models_to_try.append("gemini-2.5-flash")
+            speed_fallbacks = [
+                "gemini-3.1-flash-lite",
+                "gemini-3.5-flash-lite",
+                "gemini-flash-lite-latest",
+                "gemini-3.6-flash"
+            ]
+            for fb_model in speed_fallbacks:
+                if fb_model not in models_to_try:
+                    models_to_try.append(fb_model)
                 
             print("[STATUS: Grammar Correcting...]", flush=True)
             import urllib.request, urllib.error, time
@@ -1134,11 +1141,11 @@ def generate_captions(config):
                         url = f"https://generativelanguage.googleapis.com/v1beta/models/{attempt_model}:generateContent?key={gemini_api_key}"
                         req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers={'Content-Type': 'application/json'})
                         
-                        # 5-minute timeout with rate-limit retry
+                        # 60-second timeout per batch with rate-limit retry
                         res_data = None
                         for api_try in range(3):
                             try:
-                                with urllib.request.urlopen(req, timeout=300, context=get_ssl_context()) as response:
+                                with urllib.request.urlopen(req, timeout=60, context=get_ssl_context()) as response:
                                     res_data = json.loads(response.read().decode('utf-8'))
                                 break
                             except urllib.error.HTTPError as he:
@@ -1177,7 +1184,17 @@ def generate_captions(config):
                                     cs._original = seg
                                     
                                     # Evenly distribute new words OR inherit original timings
-                                    new_words_list = corrected_text.strip().split()
+                                    clean_corr = corrected_text.strip()
+                                    if detected_lang in ["ja", "zh", "th"] and " " not in clean_corr and getattr(seg, 'words', None) and len(seg.words) > 1 and len(clean_corr) > 1:
+                                        n_slices = min(len(seg.words), len(clean_corr))
+                                        new_words_list = []
+                                        for sl_i in range(n_slices):
+                                            s_idx = int(round(sl_i * len(clean_corr) / n_slices))
+                                            e_idx = int(round((sl_i + 1) * len(clean_corr) / n_slices))
+                                            if e_idx > s_idx:
+                                                new_words_list.append(clean_corr[s_idx:e_idx])
+                                    else:
+                                        new_words_list = clean_corr.split()
                                     if getattr(seg, 'words', None) is not None:
                                         if len(new_words_list) > 0:
                                             old_words = seg.words
@@ -1331,6 +1348,12 @@ def generate_captions(config):
                         pass
                     continue
                 except urllib.error.URLError as e:
+                    err_str = str(e).lower()
+                    if "timed out" in err_str:
+                        print(f"[STATUS: Model {attempt_model} timed out, trying fallback...]", flush=True)
+                        sys.stderr.write(f"[Gemini Timeout] {attempt_model}: {str(e)}\n")
+                        sys.stderr.flush()
+                        continue
                     print(f"[STATUS: Network unreachable, aborting AI Grammar Corrector...]", flush=True)
                     sys.stderr.write(f"[Gemini Network Error] {str(e)}\n")
                     sys.stderr.flush()
@@ -1612,7 +1635,7 @@ def generate_captions(config):
                         'Accept-Language': 'en-US,en;q=0.9',
                     }
                     
-                    clients = ['gtx', 'dict-chrome-ex']
+                    clients = ['dict-chrome-ex', 'it', 'at', 'wt']
                     for client in clients:
                         try:
                             url = f'https://translate.googleapis.com/translate_a/single?client={client}&sl=hi&tl=en&dt=rm&dt=t&q={quoted_text}'
@@ -1705,9 +1728,9 @@ def generate_captions(config):
         captions = []
         current_chunk = []
         
-        # Japanese and Chinese do not use spaces between words and need char-based chunking
+        # Japanese, Chinese, and Thai do not use spaces between words and need char-based chunking (Korean uses spaces)
         detected_lang = info.language if info and hasattr(info, 'language') else language
-        is_cjk = detected_lang in ["ja", "zh", "ko", "th"]
+        is_cjk = detected_lang in ["ja", "zh", "th"]
         join_char = "" if is_cjk else " "
         target_chars = words_per_caption * 4 if is_cjk else 0
         
@@ -1718,8 +1741,8 @@ def generate_captions(config):
             cap_start = chunk[0]['start']
             cap_end = chunk[-1]['end']
             
-            # Bound caption duration: never exceed readable natural limit (max 3.2s total, or ~0.85s/word)
-            max_cap_duration = min(3.2, max(1.2, len(chunk) * 0.85))
+            # Bound caption duration: never exceed readable natural limit (scales with words up to 8 words)
+            max_cap_duration = min(7.0, max(1.5, len(chunk) * 0.85))
             cap_end = min(cap_end, round(cap_start + max_cap_duration, 2))
             
             # Ensure minimum legible duration on screen
